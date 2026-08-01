@@ -17,6 +17,7 @@
  * measured conditions under which that stops being true.
  */
 
+import { EVENT_ID_HEADER, SIGNATURE_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
@@ -39,13 +40,16 @@ export interface DomainEvent {
 }
 
 /** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
+/** The wire version in the contract's shape; storage keeps the integer major. */
+const wireVersion = (v: number): `${number}.${number}` => `${v}.0` as `${number}.${number}`
+
 export interface EventEnvelope {
   readonly id: string
   readonly topic: string
   readonly key: string
   readonly occurredAt: string
   readonly producer: string
-  readonly version: number
+  readonly version: `${number}.${number}`
   readonly actor: string | null
   readonly correlationId: string | null
   readonly payload: Record<string, unknown>
@@ -98,19 +102,22 @@ export async function withOutbox<T>(
 
 /* ------------------------------------------------------------------------ signing */
 
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
 
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
+/**
+ * THE CONTRACT SIGNS, NOT THIS FILE — the §3.3p repair, applied here the day after five producers
+ * needed it, because this file is where they all copied the drifted version FROM. The contract
+ * signs `t=<seconds>,v1=<hmac over "seconds.body">` under `cf-signature`; the local copy signed
+ * `sha256=<hmac over body>` under a locally-spelled header, and every delivery to a
+ * contract-following inbox was refused. The exported names stay so call sites and tests do not
+ * change; the implementations are the contract's, so they cannot drift again.
+ */
 export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
+  return signDelivery(body, secret)
 }
 
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
+/** Timing-safety and the freshness window both live in the contract's verifier. */
 export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body, secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
+  return verifyDelivery(body, presented, secret).ok
 }
 
 /* ------------------------------------------------------------------------ relay */
@@ -189,7 +196,7 @@ export function createRelay(deps: RelayDeps): Handler {
         key: event.key,
         occurredAt: event.occurred_at.toISOString(),
         producer: event.producer,
-        version: event.version,
+        version: wireVersion(event.version),
         actor: event.actor,
         correlationId: event.correlation_id,
         payload: event.payload,
@@ -263,7 +270,7 @@ async function deliver(
       // The event id is the idempotency key, which is what makes this POST safe to retry and is
       // the same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, 'x-event-id': envelope.id },
+      headers: { [SIGNATURE_HEADER]: signature, [EVENT_ID_HEADER]: envelope.id },
       ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
     })
     await deps.sql`
@@ -319,3 +326,5 @@ export async function withInbox<T>(
   })
   return outcome.result
 }
+
+export { EVENT_ID_HEADER, SIGNATURE_HEADER }
