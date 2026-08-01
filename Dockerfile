@@ -29,13 +29,20 @@ WORKDIR /app
 # Dockerfile ignores would silently mask a future dependency.
 COPY --from=runtimepkgs package.json pnpm-workspace.yaml pnpm-lock.yaml /runtime/
 COPY --from=runtimepkgs packages /runtime/packages
+# THESE TWO LINES WERE MISSING while the header above already documented the contractspkgs
+# context: the prose was copied from identity's Dockerfile, the COPY lines were not, and a check
+# that grepped for 'contractspkgs' matched the comment and reported the wiring present. The
+# estate's guard-reads-its-own-prose defect, in a Dockerfile.
+COPY --from=contractspkgs package.json pnpm-workspace.yaml pnpm-lock.yaml /contracts/
+COPY --from=contractspkgs packages /contracts/packages
 
 # Install the siblings' OWN dependencies first. `link:` uses the sibling as-is and does not
 # manage its dependency tree, so /runtime's node_modules must exist independently — both for
 # `tsc` to resolve the sibling source it typechecks (jose, @opentelemetry/api) and for
 # `node --import tsx` to load @cloudsforge/* at run time.
 RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store,sharing=locked \
-    pnpm --dir /runtime install --frozen-lockfile --config.store-dir=/pnpm-store
+    pnpm --dir /runtime install --frozen-lockfile --config.store-dir=/pnpm-store \
+ && pnpm --dir /contracts install --frozen-lockfile --config.store-dir=/pnpm-store
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 # `--frozen-lockfile` is the point of the step: a build that silently resolves a different
