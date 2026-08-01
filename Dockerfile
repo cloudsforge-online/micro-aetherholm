@@ -68,6 +68,10 @@ WORKDIR /app
 # @cloudsforge/* as symlinks into it, so without the target the links dangle and the first
 # `import '@cloudsforge/db'` fails at run time.
 COPY --from=build /runtime /runtime
+# And /contracts — the deps stage grew it, the runtime stage must carry it, or tsx dies at the
+# first import with ERR_MODULE_NOT_FOUND while typecheck (which ran in the build stage, where
+# /contracts exists) stays green. The second half of the same half-copied wiring.
+COPY --from=build /contracts /contracts
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/tsconfig.json /app/tsconfig.base.json ./
