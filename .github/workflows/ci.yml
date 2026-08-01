@@ -1,0 +1,150 @@
+name: CI
+
+# The cross-cutting rules live in the shared reusable workflow (micro-org/service-ci.yml): one
+# database per service, no cross-service source imports, /livez + /readyz + /metrics, no env_file
+# fan-out, no setInterval doing domain work, .env.example agreeing with the coded PORT, and a
+# Postgres container that fails the build if the database suite skipped. Calling it is how this
+# repository counts toward the measured target of zero bespoke CI files (docs/ecosystem/03 §5).
+#
+# What the reusable workflow cannot do here is added below:
+#   - `migrate` exercises the migrator AS a migrator, on an empty database, exactly as a deploy
+#     runs it — and proves it is idempotent, because a deploy re-runs it on every release.
+#   - `rules` asserts, as text, the constraints and guards this service exists to add.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  estate:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: aetherholm
+      database-env-var: AETHERHOLM_DATABASE_URL
+      port: 4120
+      # The image startup smoke test boots the real service, and `env.ts` validates its
+      # configuration at import — so the container needs the variables it declares, not just a
+      # database. CI-only NON-secrets: a throwaway signing secret that clears a length check, a
+      # JWKS URL that is never dialled because /livez needs no identity. Never a real credential.
+      smoke-env: |
+        IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
+        IDENTITY_ISSUER=http://127.0.0.1:4001
+        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+    secrets:
+      # @cloudsforge/* resolves via link:../runtime, so the workflow checks out micro-runtime
+      # and micro-contracts as siblings — both private, hence a contents:read token.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
+
+  migrate:
+    name: The migrator, on an empty database
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        # Not a secret: this database lives for one job, is reachable only from it, and holds
+        # nothing.
+        env:
+          POSTGRES_USER: aetherholm
+          POSTGRES_PASSWORD: aetherholm
+          POSTGRES_DB: aetherholm_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U aetherholm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AETHERHOLM_DATABASE_URL: postgres://aetherholm:aetherholm@127.0.0.1:5432/aetherholm_test
+      IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+      IDENTITY_ISSUER: http://127.0.0.1:4001
+      OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+    steps:
+      # Temporary: the runtime checkout exists only because the runtime packages are unpublished.
+      # On publish this collapses to one checkout.
+      - uses: actions/checkout@v4
+        with: { path: aetherholm }
+      - uses: actions/checkout@v4
+        with: { repository: cloudsforge-online/micro-runtime, path: runtime, token: "${{ secrets.ESTATE_READ_TOKEN }}" }
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: aetherholm/pnpm-lock.yaml
+      # `link:` resolves to the sibling's own node_modules, so the sibling must be installed
+      # before this repository is — without this, `node --import tsx src/migrator.ts` cannot load
+      # the runtime source's own imports (@opentelemetry/api, jose) and dies at the first one.
+      - name: Install the sibling runtime
+        run: |
+          set -euo pipefail
+          pnpm --dir runtime install --frozen-lockfile
+      - name: Install
+        working-directory: aetherholm
+        run: pnpm install --frozen-lockfile
+      - name: Migrate the test database
+        working-directory: aetherholm
+        run: pnpm migrate
+      - name: Migrating twice is a no-op
+        working-directory: aetherholm
+        # A deploy re-runs the one-shot job on every release; a migrator that is not idempotent
+        # turns the second deploy of an unchanged schema into an outage.
+        run: pnpm migrate
+
+  rules:
+    name: The controls this service exists to add
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Asserted as text so a refactor cannot delete them without a red build. The tests prove
+      # they WORK; these prove they are still THERE.
+      - name: The world's schema invariants still exist
+        run: |
+          grep -q 'cities_stocks_settled_within_caps' src/migrations.ts \
+            || { echo '::error::the stock-settlement CHECK is gone; a settlement could write a negative or above-cap stock'; exit 1; }
+          grep -q 'cities_one_per_player_per_island' src/migrations.ts \
+            || { echo '::error::the one-city-per-player-per-island partial unique is gone; a second city is representable'; exit 1; }
+          grep -q 'provisions_entitlement_uniq' src/migrations.ts \
+            || { echo '::error::the provision idempotency unique is gone; one purchase could raise two skerries'; exit 1; }
+          grep -q 'seasons_one_open' src/migrations.ts \
+            || { echo '::error::the single-open-season index is gone; two racing replicas could open two worlds'; exit 1; }
+
+      - name: This service holds no money
+        # There is no balance or Shard column anywhere: the Charter and season pass are billing
+        # products, cosmetics are worlds entitlements, resources are game material. A balance
+        # column is the first step of a second ledger.
+        run: |
+          if grep -nE '^\s+(balance|shards|held_amount|available)\s' src/migrations.ts; then
+            echo '::error::a balance column appeared in the schema; the ledger owns balances'
+            exit 1
+          fi
+          echo 'ok: no balance column'
+
+      - name: A queue submission still requires an idempotency key
+        run: |
+          grep -q 'idempotency-key' src/server.ts \
+            || { echo '::error::a queue submission no longer requires an Idempotency-Key; a retry re-charges'; exit 1; }
+
+      - name: The provision path still cannot reach the aegis
+        # The aegis is free at founding and never sold (20-aetherholm.md §4). The suite proves the
+        # behaviour; this proves the guard test is still present.
+        run: |
+          grep -q 'aegis' src/titlecontract.test.ts \
+            || { echo '::error::the aegis-absence assertion is gone from the title-contract suite'; exit 1; }
+
+  hygiene:
+    uses: cloudsforge-online/micro-org/.github/workflows/secret-hygiene.yml@main
+    permissions:
+      contents: read

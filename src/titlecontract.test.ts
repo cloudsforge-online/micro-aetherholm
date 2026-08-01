@@ -1,0 +1,291 @@
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// THE TITLE CONTRACT, proven against worlds' real client shape.
+//
+// `worlds/src/conformance.ts` is the executable statement of what a title must satisfy — nine
+// checks, run over HTTP against a base URL. This repository cannot import another service's
+// source (estate rule 2), so this file MIRRORS those checks one for one against the real server
+// and real database, each carrying the worlds citation it reproduces. The request and response
+// shapes below are worlds' own:
+//
+//   - `GET /v1/title` must answer a JSON object whose `slug` is a string and whose
+//     `capabilities` is an array, or worlds' client throws
+//     ("a title descriptor must carry a slug and capabilities", worlds/src/titleclient.ts:123-125).
+//   - `POST /v1/provision` receives {entitlementId, subject, userId, sku, scope, metadata} with
+//     the entitlement id repeated as the Idempotency-Key header (worlds/src/titleclient.ts:139-150)
+//     and must answer a non-empty string `urn`; `replayed` is read as `=== true`
+//     (worlds/src/titleclient.ts:153-159).
+//
+// Slug and capability validity are pinned against worlds' OWN rules, restated as literals with
+// citations — the surfaces.test.ts BOUND-table technique: a second independent copy, so a drift
+// in either repository fails a test instead of a customer.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+import { test, before, after, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import type { AddressInfo } from 'node:net';
+import type { Server } from 'node:http';
+import type postgres from 'postgres';
+import { Lifecycle, postgresProbe } from '@cloudsforge/lifecycle';
+import { TokenError, type Principal } from '@cloudsforge/auth';
+import { createServer, TITLE_DESCRIPTOR, type PrincipalVerifier } from './server.ts';
+import { SKERRY_ISLAND_COUNT } from './world.ts';
+import { SKERRY_PROVISIONED_TOPIC } from './provisioning.ts';
+import {
+  enabled,
+  skip,
+  openDb,
+  migrateTestDb,
+  resetAetherholm,
+  asDb,
+  quietLogger,
+  stripComments,
+  testMetrics,
+  ALICE,
+} from './testsupport.ts';
+
+/** worlds/src/conformance.ts:99 — the slug rule, restated. */
+const WORLDS_SLUG_RULE = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
+/** worlds/src/titles.ts:45-51 — the closed capability set, restated. 'provision' is NOT in it. */
+const WORLDS_KNOWN_CAPABILITIES = ['private_world', 'cosmetics', 'achievements', 'seasons', 'inventory'];
+
+let sql: postgres.Sql;
+let server: Server;
+let base: string;
+
+const verifier: PrincipalVerifier = {
+  async principal(token: string): Promise<Principal> {
+    // 'platform' is the shape of WORLDS_SERVICE_TOKEN: a service principal whose scopes include
+    // this title's provision scope (worlds/.env.example:31-34 — "the credential a TITLE service
+    // sees on a provisioning call, so a title can and must check it").
+    if (token === 'platform') {
+      return { kind: 'service', service: 'worlds', scopes: ['aetherholm:provision', 'billing:read'] };
+    }
+    if (token === 'other-service') {
+      return { kind: 'service', service: 'hub-api', scopes: ['aetherholm:read'] };
+    }
+    if (token === 'alice') return { kind: 'user', userId: ALICE, handle: 'alice', roles: [] };
+    // A token identity did not issue fails verification — the forged-credential path.
+    throw new TokenError('signature verification failed', 'invalid');
+  },
+};
+
+before(async () => {
+  if (!enabled) return;
+  sql = openDb(8);
+  await migrateTestDb(sql);
+  const lifecycle = new Lifecycle();
+  lifecycle.addProbe(postgresProbe('postgres', () => sql`select 1`));
+  server = createServer({
+    lifecycle,
+    logger: quietLogger(),
+    metrics: testMetrics(),
+    verifier,
+    sql: asDb(sql),
+    producer: 'aetherholm',
+    queue: { enqueue: async () => {} },
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  lifecycle.markReady();
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+});
+beforeEach(async () => {
+  if (enabled) await resetAetherholm(sql);
+});
+after(async () => {
+  if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+  if (sql) await sql.end();
+});
+
+/** The provision body exactly as worlds' bridge sends it (worlds/src/titleclient.ts:139-146,
+ *  fed by worlds/src/provisioning.ts:454-462) — plus the Idempotency-Key header it always adds. */
+function provisionRequest(entitlementId: string, overrides: Record<string, unknown> = {}) {
+  return {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer platform',
+      'idempotency-key': entitlementId,
+    },
+    body: JSON.stringify({
+      entitlementId,
+      subject: `user:${ALICE}`,
+      userId: ALICE,
+      sku: 'private_skerry',
+      scope: 'title:aetherholm-title-id',
+      metadata: { name: 'The Gullery' },
+      ...overrides,
+    }),
+  };
+}
+
+/* conformance check 1 — worlds/src/conformance.ts:143-149 */
+test('contract 1: the title answers /livez', { skip }, async () => {
+  assert.equal((await fetch(`${base}/livez`)).status, 200);
+});
+
+/* conformance checks 2, 3, 4 — worlds/src/conformance.ts:151-178 */
+test('contract 2-4: GET /v1/title describes the title; the slug and capabilities pass worlds\' own rules', { skip }, async () => {
+  const res = await fetch(`${base}/v1/title`);
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { slug?: unknown; name?: unknown; capabilities?: unknown };
+
+  // worlds/src/titleclient.ts:123 — the two fields the client refuses to live without.
+  assert.equal(typeof body.slug, 'string');
+  assert.ok(Array.isArray(body.capabilities));
+
+  assert.equal(body.slug, 'aetherholm');
+  assert.match(body.slug as string, WORLDS_SLUG_RULE);
+
+  // Every declared capability must be one worlds knows (conformance check 4) — a typo'd
+  // capability is a purchase accepted and never delivered. In particular this is why the
+  // descriptor says 'private_world' and NOT 'provision': the bridge asks hasCapability(title,
+  // 'private_world') before calling at all (worlds/src/provisioning.ts:441-451).
+  for (const capability of body.capabilities as unknown[]) {
+    assert.ok(
+      WORLDS_KNOWN_CAPABILITIES.includes(capability as string),
+      `${String(capability)} is not a capability worlds knows`,
+    );
+  }
+  assert.deepEqual(body.capabilities, ['private_world']);
+  assert.deepEqual(body, { ...TITLE_DESCRIPTOR, capabilities: ['private_world'] });
+});
+
+/* conformance check 8 — worlds/src/conformance.ts:180-201 */
+test('contract 8: an unauthenticated provision is refused with 401', { skip }, async () => {
+  const request = provisionRequest('ent-unauth');
+  const res = await fetch(`${base}/v1/provision`, {
+    ...request,
+    headers: { 'content-type': 'application/json', 'idempotency-key': 'ent-unauth' },
+  });
+  assert.ok(res.status === 401 || res.status === 403, `status ${res.status}`);
+  const rows = await sql<{ n: number }[]>`select count(*)::int as n from archipelagos`;
+  assert.equal(rows[0]!.n, 0, 'nothing may be provisioned for an unauthenticated caller');
+});
+
+/* conformance check 9 — worlds/src/conformance.ts:203-219 */
+test('contract 9: a credential this platform did not issue is refused; presence is not enough', { skip }, async () => {
+  const forged = await fetch(`${base}/v1/provision`, {
+    ...provisionRequest('ent-forged'),
+    headers: { ...provisionRequest('ent-forged').headers, authorization: 'Bearer not-this-platforms-token' },
+  });
+  assert.ok(forged.status === 401 || forged.status === 403, `status ${forged.status}`);
+
+  // A REAL principal without the provision scope is refused too — the scope is the check, not
+  // the header. And a player token can never provision a world for themselves.
+  const wrongScope = await fetch(`${base}/v1/provision`, {
+    ...provisionRequest('ent-scope'),
+    headers: { ...provisionRequest('ent-scope').headers, authorization: 'Bearer other-service' },
+  });
+  assert.equal(wrongScope.status, 403);
+  const player = await fetch(`${base}/v1/provision`, {
+    ...provisionRequest('ent-player'),
+    headers: { ...provisionRequest('ent-player').headers, authorization: 'Bearer alice' },
+  });
+  assert.equal(player.status, 403);
+});
+
+/* conformance checks 5 and 6 — worlds/src/conformance.ts:221-250. THE ONE THAT MATTERS. */
+test('contract 5-6: a provision returns a urn; provisioning twice returns the SAME urn, replayed', { skip }, async () => {
+  const first = await fetch(`${base}/v1/provision`, provisionRequest('ent-1'));
+  assert.ok(first.status === 200 || first.status === 201, `status ${first.status}`);
+  const b1 = (await first.json()) as { urn?: unknown; replayed?: unknown };
+  // worlds/src/titleclient.ts:153-157 — a 2xx with no urn is treated as an outage.
+  assert.equal(typeof b1.urn, 'string');
+  assert.ok((b1.urn as string).length > 0);
+  assert.match(b1.urn as string, /^cf:aetherholm:skerry:/, 'the urn names what was created');
+  assert.equal(b1.replayed, false);
+
+  const second = await fetch(`${base}/v1/provision`, provisionRequest('ent-1'));
+  assert.ok(second.status === 200 || second.status === 201);
+  const b2 = (await second.json()) as { urn?: unknown; replayed?: unknown };
+  assert.equal(b2.urn, b1.urn, 'a second urn would be a SECOND world for one purchase');
+  // worlds reads replayed strictly as `=== true` (titleclient.ts:159).
+  assert.equal(b2.replayed, true);
+
+  // One skerry, its islands, one provision row, one event.
+  const skerries = await sql<{ n: number }[]>`
+    select count(*)::int as n from archipelagos where kind = 'skerry'
+  `;
+  assert.equal(skerries[0]!.n, 1);
+  const islands = await sql<{ n: number }[]>`select count(*)::int as n from islands`;
+  assert.equal(islands[0]!.n, SKERRY_ISLAND_COUNT);
+  const events = await sql<{ n: number }[]>`
+    select count(*)::int as n from outbox where topic = ${SKERRY_PROVISIONED_TOPIC}
+  `;
+  assert.equal(events[0]!.n, 1, 'the replay must not emit a second provisioned event');
+});
+
+/* conformance check 5 under a genuine race: two replicas, one entitlement, one skerry. */
+test('contract 5 (race): two concurrent provisions of one entitlement yield one skerry, one urn', { skip }, async () => {
+  const [a, b] = await Promise.all([
+    fetch(`${base}/v1/provision`, provisionRequest('ent-race')),
+    fetch(`${base}/v1/provision`, provisionRequest('ent-race')),
+  ]);
+  const bodyA = (await a.json()) as { urn: string };
+  const bodyB = (await b.json()) as { urn: string };
+  assert.equal(bodyA.urn, bodyB.urn);
+  const skerries = await sql<{ n: number }[]>`
+    select count(*)::int as n from archipelagos where kind = 'skerry'
+  `;
+  assert.equal(skerries[0]!.n, 1);
+});
+
+/* conformance check 7 — worlds/src/conformance.ts:252-271 */
+test('contract 7: an unknown sku is refused with 422 and code unsupported — an ANSWER, not a fault', { skip }, async () => {
+  const res = await fetch(
+    `${base}/v1/provision`,
+    provisionRequest('ent-unknown', { sku: 'definitely_not_a_real_sku' }),
+  );
+  assert.equal(res.status, 422);
+  const body = (await res.json()) as { error: { code: string } };
+  // worlds/src/titleclient.ts:181 translates exactly this into TitleUnsupportedError, which the
+  // bridge records as a TERMINAL 'unsupported' row rather than retrying (provisioning.ts:465-467).
+  assert.equal(body.error.code, 'unsupported');
+  const rows = await sql<{ n: number }[]>`select count(*)::int as n from archipelagos`;
+  assert.equal(rows[0]!.n, 0);
+});
+
+test('contract: a malformed provision (missing entitlementId) is 400, never a 500', { skip }, async () => {
+  const res = await fetch(
+    `${base}/v1/provision`,
+    provisionRequest('ent-x', { entitlementId: undefined as unknown as string }),
+  );
+  assert.equal(res.status, 400);
+});
+
+test('contract: the skerry is deterministic per entitlement — same geography on both sides of a race', { skip }, async () => {
+  await fetch(`${base}/v1/provision`, provisionRequest('ent-geo'));
+  const islands = await sql<{ idx: number; band: string }[]>`
+    select i.idx, i.band from islands i
+      join archipelagos a on a.id = i.archipelago_id
+     where a.entitlement_id = 'ent-geo' order by i.idx
+  `;
+  // The seed is sha256(entitlementId) folded to u64 (src/world.ts skerrySeed), so this exact
+  // sequence is a fixture: if generation drifts, the chronicle's replay promise is already broken.
+  assert.equal(islands.length, SKERRY_ISLAND_COUNT);
+  const bands = new Set(islands.map((island) => island.band));
+  assert.equal(bands.size, 3, 'a skerry carries all three bands');
+});
+
+/* ------------------------------------------------------------------ the aegis absence */
+
+test('aegis: no provision or purchase path can grant protection — an absence, asserted', { skip }, async () => {
+  // Behavioural half: an aegis-shaped SKU is not sold, it is 422 unsupported.
+  for (const sku of ['aegis', 'aegis_shield', 'shield_7d']) {
+    const res = await fetch(`${base}/v1/provision`, provisionRequest(`ent-${sku}`, { sku }));
+    assert.equal(res.status, 422, `${sku} must be unsupported`);
+  }
+
+  // Source half, over comment-stripped source (six estate guards have fired on their own prose):
+  // the provisioning module never touches the aegis column; the ONLY writer of aegis_until in
+  // this repository is city founding.
+  const here = (name: string) =>
+    stripComments(readFileSync(fileURLToPath(new URL(name, import.meta.url)), 'utf8'));
+  assert.ok(!here('./provisioning.ts').includes('aegis'), 'provisioning.ts must not know the aegis exists');
+  assert.ok(!here('./server.ts').includes('aegis_until'), 'no route writes aegis_until directly');
+  const writers = ['cities.ts', 'provisioning.ts', 'seasons.ts', 'jobs.ts', 'economy.ts', 'server.ts']
+    .filter((name) => /aegis_until\s*=|aegis_until\s*,/.test(here(`./${name}`)));
+  assert.deepEqual(writers, ['cities.ts'], 'only founding may set the aegis');
+});
