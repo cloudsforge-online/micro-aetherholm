@@ -21,6 +21,7 @@
 
 import { SKERRY_ISLAND_COUNT, generateIslands, skerrySeed } from './world.ts';
 import { insertIslands, isUniqueViolation } from './seasons.ts';
+import { ensureLattice } from './lattice.ts';
 import { withOutbox, type Db } from './outbox.ts';
 
 export const SKERRY_PROVISIONED_TOPIC = 'aetherholm.skerry.provisioned';
@@ -92,6 +93,9 @@ export async function provisionSkerry(
       `;
       const archipelagoId = archipelagos[0]!.id;
       await insertIslands(tx, archipelagoId, generateIslands(seed, SKERRY_ISLAND_COUNT));
+      // A skerry is born with its winds and its spires; the public world backfills via the
+      // season job, but there is no reason for a fresh world to wait a minute for weather.
+      await ensureLattice(tx, archipelagoId);
 
       const urn = urnOf(archipelagoId);
       await tx`

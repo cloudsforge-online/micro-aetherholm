@@ -13,7 +13,10 @@ import { TokenError, type Principal } from '@cloudsforge/auth';
 import { JobQueue, type Sql as JobsSql } from '@cloudsforge/jobs';
 import { createServer, type PrincipalVerifier } from './server.ts';
 import { CITY_QUEUE_KIND } from './jobs.ts';
-import { ensureOpenSeason, listIslands } from './seasons.ts';
+import { ensureOpenSeason, insertIslands, listIslands } from './seasons.ts';
+import { generateIslands } from './world.ts';
+import { sealSeason } from './sealing.ts';
+import { withOutbox } from './outbox.ts';
 import {
   enabled,
   skip,
@@ -227,6 +230,143 @@ test('server: bob cannot queue in alice\'s city — 403 not_owner', { skip }, as
   assert.equal(refused.status, 403);
   const body = (await refused.json()) as { error: { code: string } };
   assert.equal(body.error.code, 'not_owner');
+});
+
+/* ------------------------------------------------------------------ phase 2 surfaces */
+
+test('server: the airship content is public and every amount is a decimal string', { skip }, async () => {
+  const res = await fetch(`${base}/v1/content/airships`);
+  assert.equal(res.status, 200, 'content is a capability statement, like /v1/title');
+  const body = (await res.json()) as { airships: Record<string, { cargo: string; attack: string }> };
+  assert.equal(Object.keys(body.airships).length, 10);
+  assert.match(body.airships['hauler']!.cargo, /^\d+$/);
+  assert.equal(body.airships['ironclad']!.cargo, '0', 'war classes carry nothing — the split, on the wire');
+});
+
+test('server: lanes serve authenticated, and backfill a world that predates the lattice', { skip }, async () => {
+  const season = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
+  // Simulate a phase-1 world: strip the lanes the season fixture created.
+  await sql`delete from lanes`;
+  await sql`update islands set is_spire = false`;
+  const anonymous = await fetch(`${base}/v1/archipelagos/${season.archipelagoId}/lanes`);
+  assert.equal(anonymous.status, 401, 'the live lattice is player data, not public data');
+  const res = await fetch(`${base}/v1/archipelagos/${season.archipelagoId}/lanes`, {
+    headers: auth('reader'),
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { lanes: { multiplierBp: number }[] };
+  assert.ok(body.lanes.length > 0, 'the ask itself grew the lanes from the stored seed');
+});
+
+test('server: a fleet launch demands an Idempotency-Key and a real mission', { skip }, async () => {
+  const islandId = await anIsland();
+  const create = await fetch(`${base}/v1/cities`, {
+    method: 'POST', headers: auth('alice'),
+    body: JSON.stringify({ islandId, plot: 1, name: 'Aerie' }),
+  });
+  const { city } = (await create.json()) as { city: { id: string } };
+  const bare = await fetch(`${base}/v1/fleets`, {
+    method: 'POST', headers: auth('alice'),
+    body: JSON.stringify({ cityId: city.id, mission: 'raid', ships: { cutter: 1 }, targetIslandId: islandId }),
+  });
+  assert.equal(bare.status, 400, 'no Idempotency-Key, no launch');
+  const nonsense = await fetch(`${base}/v1/fleets`, {
+    method: 'POST', headers: { ...auth('alice'), 'idempotency-key': 'k-f1' },
+    body: JSON.stringify({ cityId: city.id, mission: 'parade', ships: { cutter: 1 }, targetIslandId: islandId }),
+  });
+  assert.equal(nonsense.status, 400);
+  const floaty = await fetch(`${base}/v1/fleets`, {
+    method: 'POST', headers: { ...auth('alice'), 'idempotency-key': 'k-f2' },
+    body: JSON.stringify({
+      cityId: city.id, mission: 'transfer', ships: { hauler: 1 },
+      cargo: { aether: 1.5 }, targetIslandId: islandId,
+    }),
+  });
+  assert.equal(floaty.status, 400, 'cargo is decimal strings — a float near an amount is refused');
+});
+
+test('server: a shipyard queue item needs its aerodock, and replays on its key', { skip }, async () => {
+  const islandId = await anIsland();
+  const create = await fetch(`${base}/v1/cities`, {
+    method: 'POST', headers: auth('alice'),
+    body: JSON.stringify({ islandId, plot: 1, name: 'Aerie' }),
+  });
+  const { city } = (await create.json()) as { city: { id: string } };
+  const submit = () =>
+    fetch(`${base}/v1/cities/${city.id}/ships`, {
+      method: 'POST',
+      headers: { ...auth('alice'), 'idempotency-key': 'k-keel' },
+      body: JSON.stringify({ class: 'skiff' }),
+    });
+  const dockless = await submit();
+  assert.equal(dockless.status, 400, 'a keel needs its aerodock');
+  await sql`insert into buildings (city_id, type, level) values (${city.id}, 'aerodock', 1)`;
+  const first = await submit();
+  assert.equal(first.status, 200);
+  const b1 = (await first.json()) as { item: { id: string }; replayed: boolean };
+  assert.equal(b1.replayed, false);
+  const second = await submit();
+  const b2 = (await second.json()) as { item: { id: string }; replayed: boolean };
+  assert.equal(b2.replayed, true);
+  assert.equal(b2.item.id, b1.item.id);
+});
+
+test('server: an alliance cannot be founded without its community', { skip }, async () => {
+  const season = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
+  const missing = await fetch(`${base}/v1/alliances`, {
+    method: 'POST', headers: auth('alice'),
+    body: JSON.stringify({ archipelagoId: season.archipelagoId, name: 'Compact' }),
+  });
+  assert.equal(missing.status, 400, 'communityId is required — this service refuses to create communities');
+  const created = await fetch(`${base}/v1/alliances`, {
+    method: 'POST', headers: auth('alice'),
+    body: JSON.stringify({
+      archipelagoId: season.archipelagoId,
+      communityId: '55555555-5555-4555-8555-555555555555',
+      name: 'Compact',
+    }),
+  });
+  assert.equal(created.status, 201);
+  const { alliance } = (await created.json()) as { alliance: { id: string; communityId: string } };
+  assert.equal(alliance.communityId, '55555555-5555-4555-8555-555555555555');
+});
+
+test('server: the chronicle is anonymous for SEALED seasons only', { skip }, async () => {
+  // Anonymous list: empty while nothing has sealed.
+  const empty = await fetch(`${base}/v1/chronicle/seasons`);
+  assert.equal(empty.status, 200, 'the chronicle list needs no bearer');
+  assert.deepEqual((await empty.json()) as unknown, { seasons: [] });
+
+  // Seal a season whose day has come.
+  const seasons = await sql<{ id: string }[]>`
+    insert into seasons (name, seed, status, opened_at, ends_at)
+    values ('Old', 3, 'open', now() - interval '121 days', now() - interval '1 day')
+    returning id
+  `;
+  await sql`insert into archipelagos (kind, season_id, name, seed)
+            values ('public', ${seasons[0]!.id}, 'A', 3)`;
+  const arch = await sql<{ id: string }[]>`
+    select id from archipelagos where season_id = ${seasons[0]!.id}
+  `;
+  await withOutbox(asDb(sql), 'aetherholm', async (tx) => {
+    await insertIslands(tx, arch[0]!.id, generateIslands(3n, 12));
+  });
+  await sealSeason(asDb(sql), 'aetherholm', seasons[0]!.id);
+
+  const listed = await fetch(`${base}/v1/chronicle/seasons`);
+  const body = (await listed.json()) as { seasons: { seasonId: string; digest: string }[] };
+  assert.equal(body.seasons.length, 1);
+  assert.equal(body.seasons[0]!.seasonId, seasons[0]!.id);
+
+  const detail = await fetch(`${base}/v1/chronicle/seasons/${seasons[0]!.id}`);
+  assert.equal(detail.status, 200, 'a sealed season reads anonymously');
+  const battles = await fetch(`${base}/v1/chronicle/seasons/${seasons[0]!.id}/battles`);
+  assert.equal(battles.status, 200);
+
+  // A LIVE season is not history and stays scoped.
+  const live = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
+  const refused = await fetch(`${base}/v1/chronicle/seasons/${live.id}`);
+  assert.equal(refused.status, 404, 'live-season data never leaks through the anonymous surface');
 });
 
 test('server: an empty treasury is 409 insufficient_stock, and charges nothing', { skip }, async () => {

@@ -16,10 +16,13 @@
 
 import {
   AEGIS_DAYS,
+  AIRSHIPS,
   BASE_BUILD_SLOTS,
   BASE_RESEARCH_SLOTS,
+  BASE_SHIP_SLOTS,
   buildingCost,
   buildingDurationSeconds,
+  isAirshipClass,
   isBuildingType,
   isResearchNode,
   ratesFor,
@@ -31,7 +34,7 @@ import {
   type Stocks,
 } from './content.ts';
 import { settle, snapshotAt, stocksWire, type CityEconomyRow } from './economy.ts';
-import { isUniqueViolation } from './seasons.ts';
+import { assertNotSealed, isUniqueViolation } from './seasons.ts';
 import { withOutbox, type Db, type Emit, type Tx } from './outbox.ts';
 
 export const CITY_FOUNDED_TOPIC = 'aetherholm.city.founded';
@@ -101,12 +104,13 @@ export interface CityView {
   readonly storageCap: string;
   readonly settledAt: Date;
   readonly buildings: ReadonlyArray<{ type: string; level: number }>;
+  readonly ships: ReadonlyArray<{ class: string; count: string }>;
   readonly queue: ReadonlyArray<QueueItemView>;
 }
 
 export interface QueueItemView {
   readonly id: string;
-  readonly kind: 'building' | 'research';
+  readonly kind: 'building' | 'research' | 'ship';
   readonly target: string;
   readonly status: 'queued' | 'done';
   readonly startedAt: Date;
@@ -145,6 +149,9 @@ export async function foundCity(
       `;
       const island = islands[0];
       if (!island) throw new NotFoundError('no such island');
+      // A sealed archipelago is history: the chronicle already counted its final cities, and a
+      // founding after the bell would make that count a lie.
+      await assertNotSealed(tx, island.archipelago_id);
 
       const levels = new Map<BuildingType, number>([['skyhall', 1]]);
       const rates = ratesFor(levels, island.band);
@@ -249,6 +256,9 @@ export async function getCity(sql: Db, cityId: string, now = new Date()): Promis
   const buildings = await sql<{ type: string; level: number }[]>`
     select type, level from buildings where city_id = ${cityId} order by type
   `;
+  const ships = await sql<{ class: string; count: string }[]>`
+    select class, count::text from city_ships where city_id = ${cityId} and count > 0 order by class
+  `;
   const queue = await sql<
     { id: string; kind: string; target: string; status: string; started_at: Date; completes_at: Date }[]
   >`
@@ -268,6 +278,7 @@ export async function getCity(sql: Db, cityId: string, now = new Date()): Promis
     name: row.name,
     foundedAt: row.founded_at,
     aegisUntil: row.aegis_until,
+    ships,
     stocks: stocksWire(snapshot.stocks),
     rates: stocksWire(snapshot.rates),
     storageCap: snapshot.cap.toString(),
@@ -302,7 +313,7 @@ export async function listCitiesFor(sql: Db, userId: string, now = new Date()): 
 export interface QueueInput {
   readonly cityId: string;
   readonly userId: string;
-  readonly kind: 'building' | 'research';
+  readonly kind: 'building' | 'research' | 'ship';
   readonly target: string;
   readonly idempotencyKey: string;
   readonly correlationId: string;
@@ -364,6 +375,7 @@ export async function queueWork(
       select band, archipelago_id from islands where id = ${city.island_id}
     `;
     const island = islandRows[0]!;
+    await assertNotSealed(tx, island.archipelago_id);
 
     let cost: Stocks;
     let durationSeconds: number;
@@ -380,6 +392,21 @@ export async function queueWork(
       const nextLevel = (levelRows[0]?.level ?? 0) + (queuedSame[0]?.n ?? 0) + 1;
       cost = buildingCost(input.target, nextLevel);
       durationSeconds = buildingDurationSeconds(input.target, nextLevel);
+    } else if (input.kind === 'ship') {
+      if (!isAirshipClass(input.target)) throw new ValidationError(`unknown airship class: ${input.target}`);
+      const spec = AIRSHIPS[input.target];
+      // The keel needs the dock. Checked against the BUILT level, not the queue: a hull laid on
+      // the promise of a dock still under construction is a hull laid on nothing.
+      const dockRows = await tx<{ level: number }[]>`
+        select level from buildings where city_id = ${input.cityId} and type = 'aerodock'
+      `;
+      if ((dockRows[0]?.level ?? 0) < spec.aerodock) {
+        throw new ValidationError(
+          `${input.target} needs aerodock level ${spec.aerodock} (built: ${dockRows[0]?.level ?? 0})`,
+        );
+      }
+      cost = spec.cost;
+      durationSeconds = spec.buildSeconds;
     } else {
       if (!isResearchNode(input.target)) throw new ValidationError(`unknown research node: ${input.target}`);
       const done = await tx<{ n: number }[]>`
@@ -398,9 +425,14 @@ export async function queueWork(
       durationSeconds = researchDurationSeconds(input.target);
     }
 
-    // The slot check. Base slots only in phase 1; the Charter's +2 is a billing entitlement read
+    // The slot check. Base slots only; the Charter's +2 is a billing entitlement read
     // that lands with the monetisation wiring (README, known gaps).
-    const slots = input.kind === 'building' ? BASE_BUILD_SLOTS : BASE_RESEARCH_SLOTS;
+    const slots =
+      input.kind === 'building'
+        ? BASE_BUILD_SLOTS
+        : input.kind === 'ship'
+          ? BASE_SHIP_SLOTS
+          : BASE_RESEARCH_SLOTS;
     const queued = await tx<{ n: number; last: Date | null }[]>`
       select count(*)::int as n, max(completes_at) as last from queue_items
        where city_id = ${input.cityId} and status = 'queued' and kind = ${input.kind}
@@ -517,6 +549,14 @@ export async function completeDue(
             payload: { cityId, userId: city.user_id, type: item.target, level: applied[0]!.level },
             actor: `service:${producer}`,
           });
+        } else if (item.kind === 'ship') {
+          // One hull per queue item, into the garrison. No event: a ship joining its own
+          // harbour is the player's plan proceeding, not news — the battles it fights are.
+          await tx`
+            insert into city_ships (city_id, class, count)
+            values (${cityId}, ${item.target}, 1)
+            on conflict (city_id, class) do update set count = city_ships.count + 1
+          `;
         } else {
           await tx`
             insert into research (archipelago_id, user_id, node)

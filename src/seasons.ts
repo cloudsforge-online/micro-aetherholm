@@ -16,6 +16,7 @@ import {
 } from './world.ts';
 import type { Db, Emit, Tx } from './outbox.ts';
 import { withOutbox } from './outbox.ts';
+import { ensureLattice } from './lattice.ts';
 
 export const SEASON_OPENED_TOPIC = 'aetherholm.season.opened';
 
@@ -118,6 +119,9 @@ export async function ensureOpenSeason(
 
       const islands = generateIslands(seed, PUBLIC_ISLAND_COUNT);
       await insertIslands(tx, archipelagoId, islands);
+      // The winds and the spires, in the same transaction as the geography they cross: a season
+      // whose lattice arrived later would be a world briefly without weather.
+      await ensureLattice(tx, archipelagoId);
 
       emitSeasonOpened(emit, {
         seasonId,
@@ -176,6 +180,26 @@ function emitSeasonOpened(
     },
     actor: `service:${input.producer}`,
   });
+}
+
+export class SeasonSealedError extends Error {
+  constructor() {
+    super('this season is sealed; the archipelago is history now');
+    this.name = 'SeasonSealedError';
+  }
+}
+
+/**
+ * Refuse play on an archipelago whose season has sealed (20-aetherholm.md §2: the world FREEZES).
+ * Skerries have no season and never seal. Shared by founding, queueing and launching, so "final
+ * state" in the chronicle means final.
+ */
+export async function assertNotSealed(tx: Db | Tx, archipelagoId: string): Promise<void> {
+  const rows = await tx<{ status: string }[]>`
+    select s.status from archipelagos a join seasons s on s.id = a.season_id
+     where a.id = ${archipelagoId}
+  `;
+  if (rows[0]?.status === 'sealed') throw new SeasonSealedError();
 }
 
 export function isUniqueViolation(err: unknown): boolean {

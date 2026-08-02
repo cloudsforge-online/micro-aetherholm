@@ -99,7 +99,7 @@ const runner = new JobRunner({
         metrics.observe('jobs_duration_ms', event.durationMs, { kind: event.kind });
       }
     }
-    onRunnerEvent(queue, logger)(event);
+    onRunnerEvent({ sql: db, queue, logger })(event);
   },
 });
 registerHandlers(runner, {

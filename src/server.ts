@@ -54,7 +54,30 @@ import {
 import { InsufficientStockError } from './economy.ts';
 import { listIslands, openSeason } from './seasons.ts';
 import { UnsupportedSkuError, provisionSkerry } from './provisioning.ts';
-import { CITY_QUEUE_KIND, cityQueueKey } from './jobs.ts';
+import { CITY_QUEUE_KIND, FLEET_KIND, cityQueueKey, fleetKey } from './jobs.ts';
+import { AIRSHIPS, AIRSHIP_CLASSES, RESOURCES, type Resource } from './content.ts';
+import { ensureLattice } from './lattice.ts';
+import {
+  AegisError,
+  InsufficientShipsError,
+  NoRouteError,
+  SeasonSealedError,
+  getFleet,
+  launchFleet,
+  listFleetsFor,
+  type Mission,
+} from './fleets.ts';
+import {
+  AlreadyAlignedError,
+  ClaimTakenError,
+  NotMemberError,
+  claimIsland,
+  foundAlliance,
+  getAlliance,
+  joinAlliance,
+  leaveAlliance,
+} from './alliances.ts';
+import { getChronicle, listChronicles, listSealedBattles } from './sealing.ts';
 
 export interface PrincipalVerifier {
   principal(token: string): Promise<Principal>;
@@ -103,6 +126,12 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       help: 'Queue submissions accepted, by kind. `replayed` marks idempotent retries.',
       kind: 'counter',
       labels: ['kind', 'replayed'],
+    })
+    .register({
+      name: 'aetherholm_fleets_launched_total',
+      help: 'Fleets launched, by mission. `replayed` marks idempotent retries.',
+      kind: 'counter',
+      labels: ['mission', 'replayed'],
     });
 }
 
@@ -251,6 +280,19 @@ async function handle(
     if (err instanceof InsufficientStockError) {
       return errorReply(409, 'insufficient_stock', err.message, ctx.requestId);
     }
+    if (err instanceof InsufficientShipsError) {
+      return errorReply(409, 'insufficient_ships', err.message, ctx.requestId);
+    }
+    if (err instanceof AegisError) return errorReply(409, 'aegis', err.message, ctx.requestId);
+    if (err instanceof SeasonSealedError) {
+      return errorReply(409, 'season_sealed', err.message, ctx.requestId);
+    }
+    if (err instanceof NoRouteError) return errorReply(409, 'no_route', err.message, ctx.requestId);
+    if (err instanceof AlreadyAlignedError) {
+      return errorReply(409, 'already_aligned', err.message, ctx.requestId);
+    }
+    if (err instanceof ClaimTakenError) return errorReply(409, 'claim_taken', err.message, ctx.requestId);
+    if (err instanceof NotMemberError) return errorReply(403, 'not_member', err.message, ctx.requestId);
     if (err instanceof BadRequestError || err instanceof ValidationError || err instanceof RangeError) {
       return errorReply(400, 'bad_request', err.message, ctx.requestId);
     }
@@ -436,14 +478,395 @@ function buildRoutes(): Route[] {
     define('POST', '/v1/cities/:id/research', async (ctx, deps) => {
       return queueRoute(ctx, deps, 'research');
     }),
+
+    define('POST', '/v1/cities/:id/ships', async (ctx, deps) => {
+      return queueRoute(ctx, deps, 'ship');
+    }),
+
+    /* --------------------------------------------------------------- the lattice */
+
+    // Static content, like /v1/title: what the classes ARE is a capability statement, and the
+    // client renders the shipyard from it. Bigints travel as decimal strings.
+    define('GET', '/v1/content/airships', async () => ({
+      status: 200,
+      body: {
+        airships: Object.fromEntries(
+          AIRSHIP_CLASSES.map((cls) => {
+            const spec = AIRSHIPS[cls];
+            return [
+              cls,
+              {
+                role: spec.role,
+                initiative: spec.initiative,
+                attack: spec.attack.toString(),
+                hull: spec.hull.toString(),
+                speedBp: spec.speedBp,
+                cargo: spec.cargo.toString(),
+                liftPerHour: spec.liftPerHour.toString(),
+                aerodock: spec.aerodock,
+                cost: Object.fromEntries(
+                  RESOURCES.map((resource) => [resource, spec.cost[resource].toString()]),
+                ),
+                buildSeconds: spec.buildSeconds,
+              },
+            ];
+          }),
+        ),
+      },
+    })),
+
+    define('GET', '/v1/archipelagos/:id/lanes', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps);
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('archipelago id must be a uuid');
+      // ensureLattice, not listLanes: a phase-1 world grows its winds the first time anyone asks.
+      const lanes = await ensureLattice(deps.sql, id);
+      if (lanes.length === 0) {
+        return errorReply(404, 'not_found', 'no such archipelago, or it has no lanes', ctx.requestId);
+      }
+      return { status: 200, body: { lanes } };
+    }),
+
+    /* --------------------------------------------------------------- fleets */
+
+    define('POST', '/v1/fleets', async (ctx, deps) => {
+      const userId = await requireUser(ctx, deps);
+      const key = headerOf(ctx.req, 'idempotency-key');
+      if (!key || key.length < 1 || key.length > 200) {
+        throw new BadRequestError('an Idempotency-Key header is required to launch a fleet');
+      }
+      const body = await readJson(ctx.req);
+      const cityId = requireString(body, 'cityId');
+      const mission = requireString(body, 'mission');
+      const targetIslandId = requireString(body, 'targetIslandId');
+      if (!UUID.test(cityId)) throw new BadRequestError('cityId must be a uuid');
+      if (!UUID.test(targetIslandId)) throw new BadRequestError('targetIslandId must be a uuid');
+      if (mission !== 'transfer' && mission !== 'raid' && mission !== 'siege') {
+        throw new BadRequestError('mission must be transfer, raid or siege');
+      }
+      const targetCityId =
+        typeof body['targetCityId'] === 'string' && body['targetCityId'].length > 0
+          ? body['targetCityId']
+          : undefined;
+      if (targetCityId !== undefined && !UUID.test(targetCityId)) {
+        throw new BadRequestError('targetCityId must be a uuid');
+      }
+      const rawShips = body['ships'];
+      if (typeof rawShips !== 'object' || rawShips === null || Array.isArray(rawShips)) {
+        throw new BadRequestError('ships must be an object of class → count');
+      }
+      const ships: Record<string, number> = {};
+      for (const [cls, count] of Object.entries(rawShips as Record<string, unknown>)) {
+        if (typeof count !== 'number') throw new BadRequestError(`ships.${cls} must be a number`);
+        ships[cls] = count;
+      }
+      const cargo: Partial<Record<Resource, bigint>> = {};
+      const rawCargo = body['cargo'];
+      if (rawCargo !== undefined) {
+        if (typeof rawCargo !== 'object' || rawCargo === null || Array.isArray(rawCargo)) {
+          throw new BadRequestError('cargo must be an object of resource → decimal string');
+        }
+        for (const resource of RESOURCES) {
+          const value = (rawCargo as Record<string, unknown>)[resource];
+          if (value === undefined) continue;
+          if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+            throw new BadRequestError(`cargo.${resource} must be a decimal string — never a float`);
+          }
+          cargo[resource] = BigInt(value);
+        }
+      }
+
+      const done = deps.lifecycle.track();
+      try {
+        const result = await launchFleet(deps.sql, deps.producer, {
+          cityId,
+          userId,
+          mission: mission as Mission,
+          ships,
+          cargo,
+          targetIslandId,
+          ...(targetCityId !== undefined ? { targetCityId } : {}),
+          idempotencyKey: key,
+          correlationId: ctx.requestId,
+        });
+        deps.metrics.increment('aetherholm_fleets_launched_total', {
+          mission,
+          replayed: String(result.replayed),
+        });
+        if (!result.replayed) {
+          // The arrival, keyed on the fleet. 'earliest' can only pull the run forward.
+          await deps.queue.enqueue({
+            kind: FLEET_KIND,
+            key: fleetKey(result.fleet.id),
+            payload: { fleetId: result.fleet.id },
+            runAt: result.fleet.arrivesAt,
+            onConflict: 'earliest',
+          });
+        }
+        return {
+          status: result.replayed ? 200 : 201,
+          body: { fleet: wireFleet(result.fleet), replayed: result.replayed, stocks: result.stocks },
+        };
+      } finally {
+        done();
+      }
+    }),
+
+    define('GET', '/v1/fleets', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps);
+      const requested = ctx.url.searchParams.get('userId') ?? undefined;
+      let ownerId: string;
+      if (principal.kind === 'user') {
+        if (requested && requested !== principal.userId && !isAdmin(principal)) {
+          throw new ForbiddenError('role:admin');
+        }
+        ownerId = requested ?? principal.userId;
+      } else {
+        requireScope(principal, READ_SCOPE);
+        if (!requested) throw new BadRequestError('a service must name a userId');
+        ownerId = requested;
+      }
+      const fleets = await listFleetsFor(deps.sql, ownerId);
+      return { status: 200, body: { fleets: fleets.map(wireFleet) } };
+    }),
+
+    define('GET', '/v1/fleets/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps);
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('fleet id must be a uuid');
+      const fleet = await getFleet(deps.sql, id);
+      if (!fleet) return errorReply(404, 'not_found', 'no such fleet', ctx.requestId);
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
+      else if (fleet.userId !== principal.userId && !isAdmin(principal)) {
+        // A fleet in the air is its owner's plan; even its existence stays theirs until the
+        // battle report says otherwise.
+        throw new ForbiddenError('role:admin');
+      }
+      return { status: 200, body: { fleet: wireFleet(fleet) } };
+    }),
+
+    define('GET', '/v1/battles/:id', async (ctx, deps) => {
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('battle id must be a uuid');
+      const rows = await deps.sql<
+        {
+          id: string;
+          archipelago_id: string;
+          island_id: string;
+          plot: number | null;
+          mission: string;
+          wind_bp: number;
+          attacker_user_id: string;
+          defender_user_id: string;
+          attacker_oob: unknown;
+          defender_oob: unknown;
+          result: unknown;
+          digest: string;
+          occurred_at: Date;
+          season_status: string | null;
+        }[]
+      >`
+        select b.id, b.archipelago_id, b.island_id, b.plot, b.mission, b.wind_bp,
+               b.attacker_user_id, b.defender_user_id, b.attacker_oob, b.defender_oob,
+               b.result, b.digest, b.occurred_at, s.status as season_status
+          from battles b
+          join archipelagos a on a.id = b.archipelago_id
+          left join seasons s on s.id = a.season_id
+         where b.id = ${id}
+      `;
+      const battle = rows[0];
+      if (!battle) return errorReply(404, 'not_found', 'no such battle', ctx.requestId);
+      // SEALED history is public — the chronicle rule. A LIVE battle is the participants' own.
+      if (battle.season_status !== 'sealed') {
+        const principal = await authenticate(ctx, deps);
+        if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
+        else if (
+          principal.userId !== battle.attacker_user_id &&
+          principal.userId !== battle.defender_user_id &&
+          !isAdmin(principal)
+        ) {
+          throw new ForbiddenError('role:admin');
+        }
+      }
+      return {
+        status: 200,
+        body: {
+          battle: {
+            id: battle.id,
+            islandId: battle.island_id,
+            plot: battle.plot,
+            mission: battle.mission,
+            windBp: battle.wind_bp,
+            attackerUserId: battle.attacker_user_id,
+            defenderUserId: battle.defender_user_id,
+            attackerOob: battle.attacker_oob,
+            defenderOob: battle.defender_oob,
+            result: battle.result,
+            digest: battle.digest,
+            occurredAt: battle.occurred_at.toISOString(),
+          },
+        },
+      };
+    }),
+
+    /* --------------------------------------------------------------- alliances */
+
+    define('POST', '/v1/alliances', async (ctx, deps) => {
+      const userId = await requireUser(ctx, deps);
+      const body = await readJson(ctx.req);
+      const archipelagoId = requireString(body, 'archipelagoId');
+      // Required, never minted: an alliance IS a micro-community community. This service does
+      // not create one and will not paper over its absence (20-aetherholm.md §6).
+      const communityId = requireString(body, 'communityId');
+      const name = requireString(body, 'name');
+      if (!UUID.test(archipelagoId)) throw new BadRequestError('archipelagoId must be a uuid');
+      if (!UUID.test(communityId)) {
+        throw new BadRequestError('communityId must be the uuid of an existing micro-community community');
+      }
+      const done = deps.lifecycle.track();
+      try {
+        const alliance = await foundAlliance(deps.sql, deps.producer, {
+          archipelagoId,
+          communityId,
+          name,
+          userId,
+          correlationId: ctx.requestId,
+        });
+        return { status: 201, body: { alliance } };
+      } finally {
+        done();
+      }
+    }),
+
+    define('GET', '/v1/alliances/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps);
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('alliance id must be a uuid');
+      const alliance = await getAlliance(deps.sql, id);
+      if (!alliance) return errorReply(404, 'not_found', 'no such alliance', ctx.requestId);
+      return { status: 200, body: { alliance } };
+    }),
+
+    define('POST', '/v1/alliances/:id/members', async (ctx, deps) => {
+      const userId = await requireUser(ctx, deps);
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('alliance id must be a uuid');
+      const done = deps.lifecycle.track();
+      try {
+        await joinAlliance(deps.sql, deps.producer, id, userId);
+        return { status: 200, body: { joined: true } };
+      } finally {
+        done();
+      }
+    }),
+
+    define('DELETE', '/v1/alliances/:id/members', async (ctx, deps) => {
+      const userId = await requireUser(ctx, deps);
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('alliance id must be a uuid');
+      const done = deps.lifecycle.track();
+      try {
+        await leaveAlliance(deps.sql, deps.producer, id, userId);
+        return { status: 200, body: { left: true } };
+      } finally {
+        done();
+      }
+    }),
+
+    define('POST', '/v1/alliances/:id/claims', async (ctx, deps) => {
+      const userId = await requireUser(ctx, deps);
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('alliance id must be a uuid');
+      const body = await readJson(ctx.req);
+      const islandId = requireString(body, 'islandId');
+      if (!UUID.test(islandId)) throw new BadRequestError('islandId must be a uuid');
+      const done = deps.lifecycle.track();
+      try {
+        await claimIsland(deps.sql, deps.producer, id, islandId, userId);
+        return { status: 201, body: { claimed: true } };
+      } finally {
+        done();
+      }
+    }),
+
+    /* --------------------------------------------------------------- the chronicle */
+
+    // Anonymous by design, and ONLY here: sealed seasons are public history (doc §10.1), while
+    // everything above requires a bearer. The queries themselves are scoped `status = 'sealed'`,
+    // so a live season cannot leak through this surface even by id.
+
+    define('GET', '/v1/chronicle/seasons', async (_ctx, deps) => {
+      const seasons = await listChronicles(deps.sql);
+      return {
+        status: 200,
+        body: {
+          seasons: seasons.map((season) => ({
+            seasonId: season.seasonId,
+            name: season.name,
+            seed: season.seed,
+            sealedAt: season.sealedAt.toISOString(),
+            digest: season.digest,
+          })),
+        },
+      };
+    }),
+
+    define('GET', '/v1/chronicle/seasons/:id', async (ctx, deps) => {
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('season id must be a uuid');
+      const chronicle = await getChronicle(deps.sql, id);
+      if (!chronicle) {
+        return errorReply(404, 'not_found', 'no sealed season with that id', ctx.requestId);
+      }
+      return {
+        status: 200,
+        body: {
+          summary: chronicle.summary,
+          digest: chronicle.digest,
+          sealedAt: chronicle.sealedAt.toISOString(),
+        },
+      };
+    }),
+
+    define('GET', '/v1/chronicle/seasons/:id/battles', async (ctx, deps) => {
+      const id = ctx.params['id'] ?? '';
+      if (!UUID.test(id)) throw new BadRequestError('season id must be a uuid');
+      const battles = await listSealedBattles(deps.sql, id);
+      if (!battles) {
+        return errorReply(404, 'not_found', 'no sealed season with that id', ctx.requestId);
+      }
+      return { status: 200, body: { battles } };
+    }),
   ];
 }
 
-/** The shared queue-submission handler: building and research differ only in their target set. */
+/** Dates to ISO strings for the wire; everything countable is already a decimal string. */
+function wireFleet(fleet: import('./fleets.ts').FleetView): Record<string, unknown> {
+  return {
+    id: fleet.id,
+    originCityId: fleet.originCityId,
+    userId: fleet.userId,
+    mission: fleet.mission,
+    status: fleet.status,
+    targetIslandId: fleet.targetIslandId,
+    targetCityId: fleet.targetCityId,
+    ships: fleet.ships,
+    cargo: fleet.cargo,
+    aetherLift: fleet.aetherLift,
+    departedAt: fleet.departedAt.toISOString(),
+    arrivesAt: fleet.arrivesAt.toISOString(),
+    returnsAt: fleet.returnsAt ? fleet.returnsAt.toISOString() : null,
+    travelSeconds: fleet.travelSeconds,
+  };
+}
+
+/** The shared queue-submission handler: building, research and ship differ only in target set. */
 async function queueRoute(
   ctx: RequestContext,
   deps: ServerDeps,
-  kind: 'building' | 'research',
+  kind: 'building' | 'research' | 'ship',
 ): Promise<Reply> {
   const userId = await requireUser(ctx, deps);
   const cityId = ctx.params['id'] ?? '';
@@ -454,7 +877,7 @@ async function queueRoute(
     throw new BadRequestError(`an Idempotency-Key header is required to queue a ${kind}`);
   }
   const body = await readJson(ctx.req);
-  const target = requireString(body, kind === 'building' ? 'type' : 'node');
+  const target = requireString(body, kind === 'building' ? 'type' : kind === 'ship' ? 'class' : 'node');
 
   const done = deps.lifecycle.track();
   try {

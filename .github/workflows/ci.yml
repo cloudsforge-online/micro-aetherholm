@@ -120,6 +120,16 @@ jobs:
             || { echo '::error::the provision idempotency unique is gone; one purchase could raise two skerries'; exit 1; }
           grep -q 'seasons_one_open' src/migrations.ts \
             || { echo '::error::the single-open-season index is gone; two racing replicas could open two worlds'; exit 1; }
+          grep -q 'battles_fleet_uniq' src/migrations.ts \
+            || { echo '::error::the one-battle-per-arrival unique is gone; two replicas racing one arrival could fight twice'; exit 1; }
+          grep -q 'fleets_cargo_within_hold' src/migrations.ts \
+            || { echo '::error::the deferred cargo-within-hold constraint is gone; a fleet could depart overloaded'; exit 1; }
+          grep -q 'city_ships_count_non_negative' src/migrations.ts \
+            || { echo '::error::the garrison CHECK is gone; a launch could take ships a garrison does not hold'; exit 1; }
+          grep -q 'seasons_sealed_immutable' src/migrations.ts \
+            || { echo '::error::the seal trigger is gone; sealed history would be editable (doc §9.5)'; exit 1; }
+          grep -q 'battles_immutable' src/migrations.ts \
+            || { echo '::error::the battles append-only trigger is gone; a battle report could be rewritten'; exit 1; }
 
       - name: This service holds no money
         # There is no balance or Shard column anywhere: the Charter and season pass are billing

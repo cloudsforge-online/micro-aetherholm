@@ -234,6 +234,101 @@ export function researchDurationSeconds(node: string): number {
   return 600 * (RESEARCH_NODES[branch].indexOf(node) + 1);
 }
 
+/* ------------------------------------------------------------------ airships (phase 2) */
+
+/** The 10 airship classes of 20-aetherholm.md §4, in the doc's order. */
+export const AIRSHIP_CLASSES = [
+  'skiff',
+  'cutter',
+  'corvette',
+  'gunship',
+  'frigate',
+  'ironclad',
+  'breaker',
+  'hauler',
+  'grand_hauler',
+  'flagship',
+] as const;
+export type AirshipClass = (typeof AIRSHIP_CLASSES)[number];
+
+export function isAirshipClass(value: string): value is AirshipClass {
+  return (AIRSHIP_CLASSES as readonly string[]).includes(value);
+}
+
+export interface AirshipSpec {
+  /** The freight/war split is deliberate: a raid needs Haulers to steal anything (§4). */
+  readonly role: 'scout' | 'war' | 'siege' | 'freight';
+  /** Higher acts first in a battle round. Ties resolve attacker-first, then by class name. */
+  readonly initiative: number;
+  readonly attack: bigint;
+  readonly hull: bigint;
+  /**
+   * Travel-time factor in basis points; 10000 = the lane's own time, higher is slower. A fleet
+   * moves at its SLOWEST ship's factor — a doom-stack with one Ironclad crawls like one.
+   */
+  readonly speedBp: number;
+  /** Cargo hold per ship. Non-zero ONLY for the freight classes — this is the split. */
+  readonly cargo: bigint;
+  /** Aether burned per ship per travelled hour, charged at launch for the whole round trip. */
+  readonly liftPerHour: bigint;
+  /** Minimum aerodock level to lay the keel. */
+  readonly aerodock: number;
+  readonly cost: Stocks;
+  readonly buildSeconds: number;
+}
+
+const ship = (
+  role: AirshipSpec['role'],
+  initiative: number,
+  attack: bigint,
+  hull: bigint,
+  speedBp: number,
+  cargo: bigint,
+  liftPerHour: bigint,
+  aerodock: number,
+  cost: Stocks,
+  buildSeconds: number,
+): AirshipSpec =>
+  Object.freeze({ role, initiative, attack, hull, speedBp, cargo, liftPerHour, aerodock, cost, buildSeconds });
+
+const cost = (aether: bigint, cloudstone: bigint, skysteel: bigint, provisions: bigint): Stocks =>
+  Object.freeze({ aether, cloudstone, skysteel, provisions });
+
+/**
+ * The class table. Balance numbers are content and will move to `micro-aetherholm-assets` with
+ * the trees; what is CONTRACT here is the split — only `hauler` and `grand_hauler` carry cargo —
+ * and that every number battles or the economy read is an integer.
+ */
+export const AIRSHIPS: Readonly<Record<AirshipClass, AirshipSpec>> = Object.freeze({
+  skiff: ship('scout', 10, 1n, 8n, 6000, 0n, 1n, 1, cost(10n, 15n, 5n, 10n), 180),
+  cutter: ship('war', 8, 4n, 16n, 8000, 0n, 2n, 1, cost(15n, 25n, 12n, 15n), 300),
+  corvette: ship('war', 7, 7n, 28n, 9000, 0n, 3n, 2, cost(25n, 40n, 20n, 25n), 480),
+  gunship: ship('war', 6, 12n, 40n, 10000, 0n, 4n, 3, cost(40n, 60n, 35n, 40n), 720),
+  frigate: ship('war', 5, 18n, 70n, 11000, 0n, 6n, 4, cost(60n, 90n, 60n, 60n), 1080),
+  ironclad: ship('war', 3, 24n, 120n, 13000, 0n, 9n, 5, cost(90n, 130n, 110n, 80n), 1500),
+  breaker: ship('siege', 2, 30n, 90n, 14000, 0n, 10n, 6, cost(110n, 150n, 140n, 90n), 1800),
+  hauler: ship('freight', 4, 2n, 30n, 12000, 120n, 5n, 2, cost(30n, 50n, 25n, 35n), 600),
+  grand_hauler: ship('freight', 2, 3n, 60n, 14000, 400n, 8n, 4, cost(70n, 110n, 60n, 70n), 1200),
+  flagship: ship('war', 9, 20n, 150n, 12000, 0n, 12n, 7, cost(150n, 200n, 180n, 120n), 2400),
+});
+
+/** The freight classes — the only holds a raid can carry loot home in. */
+export const FREIGHT_CLASSES: readonly AirshipClass[] = Object.freeze(
+  AIRSHIP_CLASSES.filter((cls) => AIRSHIPS[cls].cargo > 0n),
+);
+
+/** Base shipyard queue slots, alongside the build/research slots below. */
+export const BASE_SHIP_SLOTS = 2;
+
+/**
+ * What a Vault protects, per level, per resource. A raid can never touch the protected floor —
+ * the defensive counterpart of the freight split: defence buys certainty, not immunity.
+ */
+export const VAULT_PROTECTION_PER_LEVEL = 150n;
+
+/** Defender hull bonus per bulwark_ring level, in basis points (500 = +5% per level). */
+export const BULWARK_HULL_BONUS_BP_PER_LEVEL = 500;
+
 /* ------------------------------------------------------------------ queue capacity */
 
 /**

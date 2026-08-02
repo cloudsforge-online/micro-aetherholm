@@ -5,10 +5,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  AIRSHIPS,
+  AIRSHIP_CLASSES,
   ALL_RESEARCH_NODES,
   BASE_RATES,
   BASE_STORAGE_CAP,
   BUILDING_TYPES,
+  FREIGHT_CLASSES,
   RESEARCH_BRANCHES,
   RESEARCH_NODES,
   RESOURCES,
@@ -94,4 +97,45 @@ test('content: the warehouse caps storage; nothing else does', () => {
 test('content: an unknown research node refuses a cost rather than inventing one', () => {
   assert.throws(() => researchCost('alchemy'), RangeError);
   assert.throws(() => researchDurationSeconds('alchemy'), RangeError);
+});
+
+/* ------------------------------------------------------------------ airships (phase 2) */
+
+test('content: exactly 10 airship classes, all distinct, in the design order', () => {
+  // 20-aetherholm.md §4 names them: Skiff · Cutter · Corvette · Gunship · Frigate · Ironclad ·
+  // Breaker · Hauler · Grand Hauler · Flagship.
+  assert.equal(AIRSHIP_CLASSES.length, 10);
+  assert.equal(new Set(AIRSHIP_CLASSES).size, 10);
+  assert.deepEqual(
+    [...AIRSHIP_CLASSES],
+    ['skiff', 'cutter', 'corvette', 'gunship', 'frigate', 'ironclad', 'breaker', 'hauler', 'grand_hauler', 'flagship'],
+  );
+});
+
+test('content: the freight/war split — ONLY haulers carry cargo, so doom-stacks steal nothing', () => {
+  assert.deepEqual([...FREIGHT_CLASSES], ['hauler', 'grand_hauler']);
+  for (const cls of AIRSHIP_CLASSES) {
+    const spec = AIRSHIPS[cls];
+    if (spec.role === 'freight') assert.ok(spec.cargo > 0n, `${cls} is freight and must carry`);
+    else assert.equal(spec.cargo, 0n, `${cls} is ${spec.role} and must carry NOTHING home`);
+  }
+  // Exactly one siege class: the Breaker, which a siege launch requires.
+  assert.deepEqual(
+    AIRSHIP_CLASSES.filter((cls) => AIRSHIPS[cls].role === 'siege'),
+    ['breaker'],
+  );
+});
+
+test('content: every airship number battles or the economy read is an integer or bigint', () => {
+  for (const cls of AIRSHIP_CLASSES) {
+    const spec = AIRSHIPS[cls];
+    assert.equal(typeof spec.attack, 'bigint', `${cls}.attack`);
+    assert.equal(typeof spec.hull, 'bigint', `${cls}.hull`);
+    assert.equal(typeof spec.cargo, 'bigint', `${cls}.cargo`);
+    assert.equal(typeof spec.liftPerHour, 'bigint', `${cls}.liftPerHour`);
+    assert.ok(Number.isInteger(spec.initiative), `${cls}.initiative`);
+    assert.ok(Number.isInteger(spec.speedBp) && spec.speedBp > 0, `${cls}.speedBp`);
+    assert.ok(Number.isInteger(spec.buildSeconds) && spec.buildSeconds > 0, `${cls}.buildSeconds`);
+    for (const resource of RESOURCES) assert.equal(typeof spec.cost[resource], 'bigint');
+  }
 });

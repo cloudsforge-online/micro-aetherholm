@@ -76,6 +76,125 @@ export function generateIslands(seed: bigint, count: number): readonly Generated
   return islands;
 }
 
+/* ------------------------------------------------------------------ the wind lattice */
+
+/**
+ * The lattice is generated from ITS OWN stream, derived from the season seed by hashing a domain
+ * tag — never by continuing the island stream. Continuing it would mean adding one island changes
+ * every lane, and worse: phase-1 archipelagos already exist in databases, so the lattice must be
+ * derivable TODAY from a seed whose island rolls were consumed long ago. The tag makes each
+ * stream independently reproducible from the stored seed alone.
+ */
+function taggedSeed(tag: string, seed: bigint): bigint {
+  const digest = createHash('sha256').update(`${tag}:${seed.toString()}`, 'utf8').digest();
+  let folded = 0n;
+  for (let index = 0; index < 8; index += 1) folded = (folded << 8n) | BigInt(digest[index]!);
+  return folded & MASK64;
+}
+
+/** A lane's base traversal at multiplier 10000 and ship factor 10000: two hours. */
+export const BASE_LANE_SECONDS = 7200;
+/** Directed chords rolled per island, on top of the connectivity ring. */
+export const CHORDS_PER_ISLAND = 2;
+/** The direction multiplier's domain, in basis points: half-time riding the wind to double against it. */
+export const LANE_MULTIPLIER_MIN_BP = 5000;
+export const LANE_MULTIPLIER_MAX_BP = 20000;
+
+export interface GeneratedLane {
+  readonly fromIdx: number;
+  readonly toIdx: number;
+  /** Direction multiplier in basis points. A→B and B→A are separate lanes with separate rolls. */
+  readonly multiplierBp: number;
+  /** `BASE_LANE_SECONDS * multiplierBp / 10000`, floor — stored so SQL and TS cannot disagree. */
+  readonly travelSeconds: number;
+}
+
+function rollMultiplierBp(value: bigint): number {
+  const span = BigInt(LANE_MULTIPLIER_MAX_BP - LANE_MULTIPLIER_MIN_BP + 1);
+  return LANE_MULTIPLIER_MIN_BP + Number(value % span);
+}
+
+/**
+ * Generate the directed wind lattice for `count` islands from `seed`.
+ *
+ * Shape: a full ring (i → i+1 → … → i) in BOTH directions so the graph is strongly connected by
+ * construction — no fleet can be marooned by a bad roll — plus `CHORDS_PER_ISLAND` rolled chords
+ * per island, each direction rolled separately. That separateness is the design: A→B may be two
+ * hours while B→A is five (20-aetherholm.md §2), so position IS strategy.
+ *
+ * Deterministic and order-stable: one seed yields byte-identical lanes forever, because the
+ * chronicle of a sealed season replays geography from the stored seed.
+ */
+export function generateLanes(seed: bigint, count: number): readonly GeneratedLane[] {
+  if (!Number.isInteger(count) || count < 3) {
+    throw new RangeError(`a lattice needs at least 3 islands (got ${count})`);
+  }
+  let state = taggedSeed('lattice', seed);
+  const roll = (): bigint => {
+    const next = splitmix64(state);
+    state = next.next;
+    return next.value;
+  };
+  const seen = new Set<string>();
+  const lanes: GeneratedLane[] = [];
+  const add = (fromIdx: number, toIdx: number): void => {
+    if (fromIdx === toIdx) return;
+    const key = `${fromIdx}>${toIdx}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const multiplierBp = rollMultiplierBp(roll());
+    lanes.push({
+      fromIdx,
+      toIdx,
+      multiplierBp,
+      travelSeconds: Math.floor((BASE_LANE_SECONDS * multiplierBp) / 10000),
+    });
+  };
+  for (let idx = 0; idx < count; idx += 1) {
+    add(idx, (idx + 1) % count);
+    add((idx + 1) % count, idx);
+  }
+  for (let idx = 0; idx < count; idx += 1) {
+    for (let chord = 0; chord < CHORDS_PER_ISLAND; chord += 1) {
+      const target = Number(roll() % BigInt(count));
+      // Both directions, rolled separately — the chord exists both ways, the WIND does not.
+      add(idx, target);
+      add(target, idx);
+    }
+  }
+  return lanes;
+}
+
+/* ------------------------------------------------------------------ the aether spires */
+
+/** One spire per ~40 islands, never fewer than three: a season with one objective is a race,
+ *  three is a war. 200 public islands → 5 spires; a 12-isle skerry → 3. */
+export function spireCountFor(islandCount: number): number {
+  return Math.max(3, Math.floor(islandCount / 40));
+}
+
+/**
+ * Which island indices carry Aether Spires, derived from the seed on its own tagged stream.
+ *
+ * Returned ascending. Deterministic re-derivation is the point: phase-1 rows predate the flag,
+ * so the backfill recomputes from the stored seed and MUST agree with what a fresh generation
+ * would have said.
+ */
+export function spireIdxsFor(seed: bigint, islandCount: number): readonly number[] {
+  if (!Number.isInteger(islandCount) || islandCount < 3) {
+    throw new RangeError(`an archipelago needs at least 3 islands (got ${islandCount})`);
+  }
+  let state = taggedSeed('spires', seed);
+  const chosen = new Set<number>();
+  const wanted = spireCountFor(islandCount);
+  while (chosen.size < wanted) {
+    const next = splitmix64(state);
+    state = next.next;
+    chosen.add(Number(next.value % BigInt(islandCount)));
+  }
+  return [...chosen].sort((a, b) => a - b);
+}
+
 /** A fresh 64-bit seed from the platform CSPRNG, as a decimal string for numeric(20,0). */
 export function newSeed(random: () => Buffer = randomBytes8): bigint {
   const bytes = random();

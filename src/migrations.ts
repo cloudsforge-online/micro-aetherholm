@@ -335,6 +335,352 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 9,
+    name: 'wind_lattice',
+    up: `
+      -- The directed wind lattice (20-aetherholm.md §2). Travel is not euclidean: a lane has a
+      -- DIRECTION multiplier, so A→B and B→A are two rows with two rolls. Rows are derived
+      -- deterministically from the archipelago's seed (src/world.ts generateLanes) — stored
+      -- rather than recomputed per request because fleets reference the lane they approached on,
+      -- and a battle report must be able to name it forever.
+      create table if not exists lanes (
+        id             uuid    primary key default gen_random_uuid(),
+        archipelago_id uuid    not null references archipelagos (id) on delete cascade,
+        from_island_id uuid    not null references islands (id) on delete cascade,
+        to_island_id   uuid    not null references islands (id) on delete cascade,
+        multiplier_bp  integer not null,
+        travel_seconds integer not null,
+        -- A lane to itself is a generator bug, not a shortcut.
+        constraint lanes_no_self check (from_island_id <> to_island_id),
+        -- The generator's own domain (src/world.ts): half-time with the wind, double against it.
+        constraint lanes_multiplier_range check (multiplier_bp between 5000 and 20000),
+        constraint lanes_travel_positive check (travel_seconds > 0),
+        -- One lane per direction. The backfill job recomputes from the seed on every replica;
+        -- this is what lets N racing recomputations converge instead of duplicating.
+        constraint lanes_directed_uniq unique (from_island_id, to_island_id)
+      );
+
+      create index if not exists lanes_archipelago_idx on lanes (archipelago_id);
+
+      -- The Aether Spires: the islands whoever holds at day 120 wins the season. Derived from
+      -- the seed (src/world.ts spireIdxsFor); phase-1 rows are backfilled by the season.ensure
+      -- job recomputing from the stored seed, which must agree with a fresh generation.
+      alter table islands add column if not exists is_spire boolean not null default false;
+    `,
+  },
+  {
+    version: 10,
+    name: 'garrisons_and_fleets',
+    up: `
+      -- The garrison: ships at home, per city per class. Counts, not rows-per-ship — a battle
+      -- reads and writes thousands at once.
+      create table if not exists city_ships (
+        city_id uuid   not null references cities (id) on delete cascade,
+        class   text   not null,
+        count   bigint not null default 0,
+        primary key (city_id, class),
+        constraint city_ships_class_known check (class in (
+          'skiff','cutter','corvette','gunship','frigate','ironclad','breaker','hauler',
+          'grand_hauler','flagship'
+        )),
+        -- ═══════════════════════════════════════════════════════════════════════════════════
+        -- A LAUNCH MAY NEVER TAKE SHIPS A GARRISON DOES NOT HOLD. The launch decrements with a
+        -- guarded UPDATE; this CHECK is what holds against the guard not yet mis-written and
+        -- the operator UPDATE — the same two-layer shape as the stock CHECK above it.
+        -- ═══════════════════════════════════════════════════════════════════════════════════
+        constraint city_ships_count_non_negative check (count >= 0)
+      );
+
+      create table if not exists fleets (
+        id               uuid        primary key default gen_random_uuid(),
+        origin_city_id   uuid        not null references cities (id),
+        user_id          uuid        not null,
+        mission          text        not null,
+        status           text        not null default 'outbound',
+        target_island_id uuid        not null references islands (id),
+        target_city_id   uuid        references cities (id),
+        -- The lane of approach: the LAST hop of the outbound path. The wind-advantage modifier
+        -- in a battle comes from this row, so it is recorded, not recomputed.
+        approach_lane_id uuid        references lanes (id),
+        departed_at      timestamptz not null default now(),
+        arrives_at       timestamptz not null,
+        travel_seconds   integer     not null,
+        return_seconds   integer     not null,
+        returns_at       timestamptz,
+        resolved_at      timestamptz,
+        -- Aether burned as lift, charged at LAUNCH against the origin's lazy stocks for the
+        -- whole round trip. Recorded so a player can see what a fleet cost.
+        aether_lift      bigint      not null,
+        -- Cargo aboard: what a transfer carries out, what a raid carries home. Same bigint rule
+        -- as city stocks — no float ever touches an amount.
+        cargo_aether     bigint      not null default 0,
+        cargo_cloudstone bigint      not null default 0,
+        cargo_skysteel   bigint      not null default 0,
+        cargo_provisions bigint      not null default 0,
+        -- ═══════════════════════════════════════════════════════════════════════════════════
+        -- THE IDEMPOTENCY OF A LAUNCH: same discipline as queue_items, same reason. The
+        -- fingerprint compared on replay is the mission tuple, never the correlation id.
+        -- ═══════════════════════════════════════════════════════════════════════════════════
+        idempotency_key  text        not null,
+        created_at       timestamptz not null default now(),
+        constraint fleets_mission_known check (mission in ('transfer','raid','siege')),
+        constraint fleets_status_known check (status in ('outbound','besieging','returning','done')),
+        constraint fleets_times_ordered check (arrives_at > departed_at),
+        constraint fleets_travel_positive check (travel_seconds > 0 and return_seconds > 0),
+        constraint fleets_lift_non_negative check (aether_lift >= 0),
+        constraint fleets_cargo_non_negative check (
+          cargo_aether >= 0 and cargo_cloudstone >= 0 and cargo_skysteel >= 0 and cargo_provisions >= 0
+        ),
+        constraint fleets_key_uniq unique (origin_city_id, idempotency_key)
+      );
+
+      create index if not exists fleets_user_idx on fleets (user_id, departed_at desc);
+      create index if not exists fleets_unresolved_idx on fleets (arrives_at)
+        where status in ('outbound','besieging','returning');
+
+      create table if not exists fleet_ships (
+        fleet_id uuid   not null references fleets (id) on delete cascade,
+        class    text   not null,
+        count    bigint not null,
+        primary key (fleet_id, class),
+        constraint fleet_ships_class_known check (class in (
+          'skiff','cutter','corvette','gunship','frigate','ironclad','breaker','hauler',
+          'grand_hauler','flagship'
+        )),
+        -- Zero-count rows are deleted, not kept: an empty class in a fleet is not a fact.
+        constraint fleet_ships_count_positive check (count > 0)
+      );
+
+      -- ═════════════════════════════════════════════════════════════════════════════════════
+      -- A FLEET NEVER DEPARTS — OR RETURNS — WITH MORE CARGO THAN HOLD (20-aetherholm.md §6).
+      -- Cargo capacity comes from the composition, so the constraint must see fleets AND
+      -- fleet_ships together; it is a DEFERRED constraint trigger so the two inserts commit as
+      -- one judgement, whatever order the handler wrote them in. The per-class holds are the
+      -- content table's (src/content.ts AIRSHIPS) and content.test.ts asserts the two cannot
+      -- drift. Only the freight classes carry: that CASE is the freight/war split, in SQL.
+      -- ═════════════════════════════════════════════════════════════════════════════════════
+      create or replace function aetherholm_class_cargo(cls text) returns bigint
+      language sql immutable as $fn$
+        select case cls
+          when 'hauler' then 120
+          when 'grand_hauler' then 400
+          else 0
+        end::bigint
+      $fn$;
+
+      create or replace function aetherholm_assert_fleet_cargo(fid uuid) returns void
+      language plpgsql as $fn$
+      declare
+        aboard bigint;
+        hold   bigint;
+      begin
+        select cargo_aether + cargo_cloudstone + cargo_skysteel + cargo_provisions
+          into aboard from fleets where id = fid;
+        if not found then return; end if; -- the fleet row was deleted; nothing to hold
+        select coalesce(sum(count * aetherholm_class_cargo(class)), 0)
+          into hold from fleet_ships where fleet_id = fid;
+        if aboard > hold then
+          raise exception 'fleet % carries % cargo but holds only %', fid, aboard, hold
+            using errcode = 'check_violation', constraint = 'fleets_cargo_within_hold';
+        end if;
+      end;
+      $fn$;
+
+      create or replace function aetherholm_fleet_cargo_trigger() returns trigger
+      language plpgsql as $fn$
+      begin
+        perform aetherholm_assert_fleet_cargo(coalesce(new.id, old.id));
+        return null;
+      end;
+      $fn$;
+
+      create or replace function aetherholm_fleet_ships_cargo_trigger() returns trigger
+      language plpgsql as $fn$
+      begin
+        perform aetherholm_assert_fleet_cargo(coalesce(new.fleet_id, old.fleet_id));
+        return null;
+      end;
+      $fn$;
+
+      drop trigger if exists fleets_cargo_within_hold on fleets;
+      create constraint trigger fleets_cargo_within_hold
+        after insert or update on fleets
+        deferrable initially deferred
+        for each row execute function aetherholm_fleet_cargo_trigger();
+
+      drop trigger if exists fleet_ships_cargo_within_hold on fleet_ships;
+      create constraint trigger fleet_ships_cargo_within_hold
+        after insert or update or delete on fleet_ships
+        deferrable initially deferred
+        for each row execute function aetherholm_fleet_ships_cargo_trigger();
+
+      -- The shipyard joins the queue kinds. Additive: the CHECK is re-stated, not weakened —
+      -- 'ship' targets an airship class exactly as 'building' targets a building type.
+      alter table queue_items drop constraint if exists queue_items_kind_known;
+      alter table queue_items add constraint queue_items_kind_known
+        check (kind in ('building','research','ship'));
+    `,
+  },
+  {
+    version: 11,
+    name: 'battles',
+    up: `
+      -- One row per battle, holding EVERYTHING a re-resolution needs: (id, seed, both orders of
+      -- battle, the wind) — the determinism claim of 20-aetherholm.md §4 as columns. The digest
+      -- is sha256 over the canonicalised result, the way trade proves backtests.
+      create table if not exists battles (
+        id               uuid          primary key default gen_random_uuid(),
+        archipelago_id   uuid          not null references archipelagos (id),
+        island_id        uuid          not null references islands (id),
+        plot             smallint,
+        fleet_id         uuid          not null references fleets (id),
+        mission          text          not null,
+        lane_id          uuid          references lanes (id),
+        attacker_user_id uuid          not null,
+        defender_user_id uuid          not null,
+        seed             numeric(20,0) not null,
+        wind_bp          integer       not null,
+        attacker_oob     jsonb         not null,
+        defender_oob     jsonb         not null,
+        result           jsonb         not null,
+        digest           text          not null,
+        occurred_at      timestamptz   not null default now(),
+        constraint battles_mission_known check (mission in ('raid','siege')),
+        constraint battles_seed_range check (seed >= 0 and seed <= 18446744073709551615),
+        constraint battles_digest_shape check (digest ~ '^[0-9a-f]{64}$'),
+        -- ═══════════════════════════════════════════════════════════════════════════════════
+        -- ONE ARRIVAL, ONE BATTLE. Two replicas racing one arrival serialise on the fleet:<id>
+        -- job lease and on the fleet's status guard — and even if both were lost, THIS is where
+        -- the second battle becomes unrepresentable rather than merely unlikely (§9.3).
+        -- ═══════════════════════════════════════════════════════════════════════════════════
+        constraint battles_fleet_uniq unique (fleet_id)
+      );
+
+      create index if not exists battles_archipelago_idx on battles (archipelago_id, occurred_at desc);
+      create index if not exists battles_defender_idx on battles (defender_user_id, occurred_at desc);
+
+      -- Append-only, like activity_records and for the same reason: a battle report that can be
+      -- edited afterwards is not a report, it is the last thing somebody said. The chronicle of
+      -- a sealed season serves these rows verbatim; UPDATE and DELETE are refused to everyone,
+      -- operators with psql included.
+      create or replace function aetherholm_battles_frozen() returns trigger as $$
+      begin
+        raise exception 'battles are immutable history; a correction is a new battle';
+      end;
+      $$ language plpgsql;
+
+      drop trigger if exists battles_immutable on battles;
+      create trigger battles_immutable
+        before update or delete on battles
+        for each row execute function aetherholm_battles_frozen();
+    `,
+  },
+  {
+    version: 12,
+    name: 'alliances',
+    up: `
+      -- An alliance IS a micro-community community (20-aetherholm.md §6): proposals, votes,
+      -- officers, timelocks and the treasury live THERE. What lives here is play — the binding
+      -- and the claims. community_id is a reference by id across the service boundary, never a
+      -- foreign key into another service's tables (04-domain-model §11), and this service
+      -- REFUSES to create communities: it stores one the caller already has.
+      create table if not exists alliances (
+        id             uuid        primary key default gen_random_uuid(),
+        archipelago_id uuid        not null references archipelagos (id) on delete cascade,
+        community_id   uuid        not null,
+        name           text        not null,
+        founded_by     uuid        not null,
+        created_at     timestamptz not null default now(),
+        constraint alliances_name_length check (char_length(name) between 1 and 60),
+        -- One community backs at most one alliance per world: two alliances sharing a treasury
+        -- and a vote would be one alliance wearing two banners.
+        constraint alliances_community_uniq unique (archipelago_id, community_id)
+      );
+
+      create table if not exists alliance_members (
+        alliance_id    uuid        not null references alliances (id) on delete cascade,
+        -- Denormalised on purpose: the one-alliance-per-player-per-world unique below needs the
+        -- archipelago on THIS row to be declarable at all.
+        archipelago_id uuid        not null references archipelagos (id) on delete cascade,
+        user_id        uuid        not null,
+        joined_at      timestamptz not null default now(),
+        primary key (alliance_id, user_id),
+        -- A player flies one banner per world. Unrepresentable, not policed.
+        constraint alliance_members_one_per_world unique (archipelago_id, user_id)
+      );
+
+      -- An island claim: the alliance's stake in the lattice. One claim per island — first
+      -- banner planted wins, and the primary key is what makes the race safe.
+      create table if not exists alliance_claims (
+        island_id   uuid        primary key references islands (id) on delete cascade,
+        alliance_id uuid        not null references alliances (id) on delete cascade,
+        claimed_by  uuid        not null,
+        claimed_at  timestamptz not null default now()
+      );
+
+      create index if not exists alliance_claims_alliance_idx on alliance_claims (alliance_id);
+    `,
+  },
+  {
+    version: 13,
+    name: 'sealing',
+    up: `
+      alter table seasons add column if not exists sealed_at timestamptz;
+
+      -- A sealed season says WHEN, always; an open one never does.
+      alter table seasons drop constraint if exists seasons_sealed_is_dated;
+      alter table seasons add constraint seasons_sealed_is_dated
+        check ((status = 'sealed') = (sealed_at is not null));
+
+      -- The chronicle: one row per sealed season, the replay browser's data source. The summary
+      -- is the final state; the digest is sha256 over its canonicalised form, so "this is what
+      -- happened" is checkable by anyone holding the bytes.
+      create table if not exists chronicles (
+        season_id uuid        primary key references seasons (id),
+        sealed_at timestamptz not null,
+        summary   jsonb       not null,
+        digest    text        not null,
+        constraint chronicles_digest_shape check (digest ~ '^[0-9a-f]{64}$')
+      );
+
+      -- ═══════════════════════════════════════════════════════════════════════════════════════
+      -- SEALED MEANS SEALED (20-aetherholm.md §9.5). An UPDATE or DELETE on a sealed season is a
+      -- database error, even for a caller holding a connection — a policy would guard the
+      -- handlers, the trigger guards psql. The sealing transition itself passes because the row
+      -- it rewrites is still 'open'; the FIRST statement to see old.status = 'sealed' is refused,
+      -- so history freezes at the moment of sealing and never thaws.
+      -- ═══════════════════════════════════════════════════════════════════════════════════════
+      create or replace function aetherholm_seasons_sealed_frozen() returns trigger as $$
+      begin
+        if old.status = 'sealed' then
+          raise exception 'season % is sealed; sealed history is immutable', old.id;
+        end if;
+        if tg_op = 'DELETE' then
+          return old;
+        end if;
+        return new;
+      end;
+      $$ language plpgsql;
+
+      drop trigger if exists seasons_sealed_immutable on seasons;
+      create trigger seasons_sealed_immutable
+        before update or delete on seasons
+        for each row execute function aetherholm_seasons_sealed_frozen();
+
+      -- The chronicle is immutable from birth: it only ever describes a sealed season.
+      create or replace function aetherholm_chronicles_frozen() returns trigger as $$
+      begin
+        raise exception 'the chronicle is immutable; a sealed season reads as it sealed';
+      end;
+      $$ language plpgsql;
+
+      drop trigger if exists chronicles_immutable on chronicles;
+      create trigger chronicles_immutable
+        before update or delete on chronicles
+        for each row execute function aetherholm_chronicles_frozen();
+    `,
+  },
 ];
 
 /** The version this build requires. `index.ts` asserts it at boot and refuses to serve below it. */
@@ -345,6 +691,15 @@ export const BASELINE_VERSION = 0;
 
 /** Every table this service owns, for the test harness's truncate. Order is child-first. */
 export const TABLES: readonly string[] = Object.freeze([
+  'chronicles',
+  'battles',
+  'fleet_ships',
+  'fleets',
+  'city_ships',
+  'alliance_claims',
+  'alliance_members',
+  'alliances',
+  'lanes',
   'provisions',
   'research',
   'queue_items',
