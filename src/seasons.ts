@@ -217,14 +217,22 @@ export interface IslandSummary {
   readonly band: string;
   readonly plots: number;
   readonly freePlots: number;
+  /**
+   * Whether this island is an Aether Spire — the victory objective the whole season contests.
+   * The column has existed since the lattice migration (`migrations.ts`, maintained at
+   * `lattice.ts:80`) and this summary never selected it, so no client could mark a spire on any
+   * map: the one thing doc 20 §5 says the archipelago screen must show. Found by
+   * micro-aetherholm-web building that screen.
+   */
+  readonly spire: boolean;
 }
 
 /** The islands of an archipelago with their free plot counts — what a founder chooses from. */
 export async function listIslands(sql: Db, archipelagoId: string): Promise<IslandSummary[]> {
   const rows = await sql<
-    { id: string; idx: number; band: string; plots: number; occupied: number }[]
+    { id: string; idx: number; band: string; plots: number; occupied: number; is_spire: boolean }[]
   >`
-    select i.id, i.idx, i.band, i.plots,
+    select i.id, i.idx, i.band, i.plots, i.is_spire,
            (select count(*)::int from cities c where c.island_id = i.id and c.abandoned_at is null)
              as occupied
       from islands i
@@ -237,5 +245,6 @@ export async function listIslands(sql: Db, archipelagoId: string): Promise<Islan
     band: row.band,
     plots: row.plots,
     freePlots: row.plots - row.occupied,
+    spire: row.is_spire,
   }));
 }

@@ -47,6 +47,20 @@ after(async () => {
   if (sql) await sql.end();
 });
 
+test('seasons: the islands a founder reads carry the spire flag the map must mark', { skip }, async () => {
+  // The column existed since the lattice migration and the summary never selected it, so no
+  // client could mark a spire on any map — the one thing the archipelago screen exists to show.
+  // Found by micro-aetherholm-web; this pins the read against the stored truth.
+  const season = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
+  const islands = await listIslands(asDb(sql), season.archipelagoId);
+  const served = islands.filter((i) => i.spire).length;
+  assert.ok(served >= 1, 'a generated world has spires, and the read must surface them');
+  const stored = await sql<{ n: number }[]>`
+    select count(*)::int as n from islands where archipelago_id = ${season.archipelagoId} and is_spire
+  `;
+  assert.equal(served, stored[0]!.n, 'the served flags are exactly the stored ones');
+});
+
 async function firstIsland(): Promise<string> {
   const season = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
   const islands = await listIslands(asDb(sql), season.archipelagoId);
