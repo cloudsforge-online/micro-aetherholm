@@ -51,11 +51,23 @@ import {
   listCitiesFor,
   queueWork,
 } from './cities.ts';
-import { InsufficientStockError } from './economy.ts';
-import { listIslands, openSeason } from './seasons.ts';
+import { stocksWire, InsufficientStockError } from './economy.ts';
+import { ensureOpenSeason, listIslands, openSeason } from './seasons.ts';
 import { UnsupportedSkuError, provisionSkerry } from './provisioning.ts';
 import { CITY_QUEUE_KIND, FLEET_KIND, cityQueueKey, fleetKey } from './jobs.ts';
-import { AIRSHIPS, AIRSHIP_CLASSES, RESOURCES, type Resource } from './content.ts';
+import {
+  AIRSHIPS,
+  AIRSHIP_CLASSES,
+  BUILDING_TYPES,
+  RESEARCH_BRANCHES,
+  RESEARCH_NODES,
+  RESOURCES,
+  buildingCost,
+  buildingDurationSeconds,
+  researchCost,
+  researchDurationSeconds,
+  type Resource,
+} from './content.ts';
 import { ensureLattice } from './lattice.ts';
 import {
   AegisError,
@@ -76,7 +88,9 @@ import {
   getAlliance,
   joinAlliance,
   leaveAlliance,
+  listAlliances,
 } from './alliances.ts';
+import { listBattlesFor } from './battles.ts';
 import { getChronicle, listChronicles, listSealedBattles } from './sealing.ts';
 
 export interface PrincipalVerifier {
@@ -487,6 +501,46 @@ function buildRoutes(): Route[] {
 
     // Static content, like /v1/title: what the classes ARE is a capability statement, and the
     // client renders the shipyard from it. Bigints travel as decimal strings.
+    // Building and research cost curves, public like the airship table and for the same reason:
+    // the queue forms must show real numbers BEFORE commit, mirrored from the one source the
+    // engine itself charges from. micro-aetherholm-web shipped those forms honestly blank and
+    // reported the gap; this closes it without a second copy of any formula.
+    define('GET', '/v1/content/buildings', async () => ({
+      status: 200,
+      body: {
+        buildings: Object.fromEntries(
+          BUILDING_TYPES.map((type) => [
+            type,
+            {
+              // cost(level) = base × level; served as the base with the rule named, and the
+              // level-1 values exact, so a client renders truth without restating arithmetic.
+              baseCost: stocksWire(buildingCost(type, 1)),
+              costRule: 'base × level',
+              durationSecondsPerLevel: buildingDurationSeconds(type, 1),
+            },
+          ]),
+        ),
+      },
+    })),
+
+    define('GET', '/v1/content/research', async () => ({
+      status: 200,
+      body: {
+        research: Object.fromEntries(
+          RESEARCH_BRANCHES.flatMap((branch) =>
+            RESEARCH_NODES[branch].map((node) => [
+              node,
+              {
+                branch,
+                cost: stocksWire(researchCost(node)),
+                durationSeconds: researchDurationSeconds(node),
+              },
+            ]),
+          ),
+        ),
+      },
+    })),
+
     define('GET', '/v1/content/airships', async () => ({
       status: 200,
       body: {
@@ -646,6 +700,40 @@ function buildRoutes(): Route[] {
       return { status: 200, body: { fleet: wireFleet(fleet) } };
     }),
 
+    define('GET', '/v1/battles', async (ctx, deps) => {
+      // The owner pattern of GET /v1/fleets, verbatim: a user sees their own history, an admin
+      // anyone's, a service names a userId under the read scope.
+      const principal = await authenticate(ctx, deps);
+      const requested = ctx.url.searchParams.get('userId') ?? undefined;
+      let ownerId: string;
+      if (principal.kind === 'user') {
+        if (requested && requested !== principal.userId && !isAdmin(principal)) {
+          throw new ForbiddenError('role:admin');
+        }
+        ownerId = requested ?? principal.userId;
+      } else {
+        requireScope(principal, READ_SCOPE);
+        if (!requested) throw new BadRequestError('a service must name a userId');
+        ownerId = requested;
+      }
+      const battles = await listBattlesFor(deps.sql, ownerId, 50);
+      return {
+        status: 200,
+        body: {
+          battles: battles.map((b) => ({
+            id: b.id,
+            mission: b.mission,
+            islandId: b.islandId,
+            attackerUserId: b.attackerUserId,
+            defenderUserId: b.defenderUserId,
+            outcome: b.outcome,
+            digest: b.digest,
+            occurredAt: b.occurredAt.toISOString(),
+          })),
+        },
+      };
+    }),
+
     define('GET', '/v1/battles/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('battle id must be a uuid');
@@ -737,6 +825,15 @@ function buildRoutes(): Route[] {
       } finally {
         done();
       }
+    }),
+
+    define('GET', '/v1/alliances', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps);
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
+      const season = await ensureOpenSeason(deps.sql, deps.producer, new Date());
+      const viewer = principal.kind === 'user' ? principal.userId : null;
+      const alliances = await listAlliances(deps.sql, season.archipelagoId, viewer);
+      return { status: 200, body: { alliances } };
     }),
 
     define('GET', '/v1/alliances/:id', async (ctx, deps) => {

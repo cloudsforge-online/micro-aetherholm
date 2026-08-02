@@ -23,6 +23,7 @@
  * fraction; the tie goes to the defender, because the attacker chose the fight.
  */
 
+import type { Db } from './outbox.ts'
 import { createHash } from 'node:crypto';
 import {
   AIRSHIPS,
@@ -261,3 +262,54 @@ export function windAdvantageBp(laneMultiplierBp: number): number {
   const raw = 10000 + Math.floor((10000 - laneMultiplierBp) / 4);
   return Math.min(12500, Math.max(7500, raw));
 }
+/** One line of a player's battle history. The full report stays at GET /v1/battles/:id. */
+export interface BattleSummary {
+  readonly id: string;
+  readonly mission: string;
+  readonly islandId: string | null;
+  readonly attackerUserId: string;
+  readonly defenderUserId: string;
+  readonly outcome: string;
+  readonly digest: string;
+  readonly occurredAt: Date;
+}
+
+/**
+ * The battles a user fought, either side, newest first.
+ *
+ * micro-aetherholm-web found the gap: only the by-id read existed, so a report could be opened
+ * from a pasted id or the sealed chronicle and from nowhere else — a player could not see their
+ * own history. The outcome is read from the stored result the same way the report renders it:
+ * stored truth, never recomputed.
+ */
+export async function listBattlesFor(sql: Db, userId: string, limit: number): Promise<BattleSummary[]> {
+  const rows = await sql<
+    {
+      id: string;
+      mission: string;
+      island_id: string | null;
+      attacker_user_id: string;
+      defender_user_id: string;
+      result: { outcome?: string };
+      digest: string;
+      occurred_at: Date;
+    }[]
+  >`
+    select id, mission, island_id, attacker_user_id, defender_user_id, result, digest, occurred_at
+      from battles
+     where attacker_user_id = ${userId} or defender_user_id = ${userId}
+     order by occurred_at desc
+     limit ${limit}
+  `;
+  return rows.map((r) => ({
+    id: r.id,
+    mission: r.mission,
+    islandId: r.island_id,
+    attackerUserId: r.attacker_user_id,
+    defenderUserId: r.defender_user_id,
+    outcome: typeof r.result?.outcome === 'string' ? r.result.outcome : 'unknown',
+    digest: r.digest,
+    occurredAt: r.occurred_at,
+  }));
+}
+

@@ -119,6 +119,8 @@ everything else 401s without a bearer token.
 | `GET` | `/v1/seasons/current` | user, or service with `aetherholm:read` | — | the open season, seed as a decimal string (`src/server.ts:382`) |
 | `GET` | `/v1/archipelagos/:id/islands` | user, or service with `aetherholm:read` | — | islands with free plot counts (`src/server.ts:401`) |
 | `GET` | `/v1/archipelagos/:id/lanes` | user, or service with `aetherholm:read` | — | the wind lattice; the ask backfills a pre-lattice world from its seed (`src/server.ts:518`) |
+| `GET` | `/v1/content/buildings` | none | the 20 building base costs and durations, mirrored from the one source the engine charges from (`src/server.ts`, beside airships) |
+| `GET` | `/v1/content/research` | none | the 32 research nodes with exact costs and durations |
 | `GET` | `/v1/content/airships` | anyone | — | the 10 classes, amounts as decimal strings (`src/server.ts:490`) |
 | `POST` | `/v1/cities` | user (service with `aetherholm:write` + `x-user-id`) | the partial unique IS the idempotency | found a city; refused on a sealed season (`src/server.ts:415`) |
 | `GET` | `/v1/cities` | own list; admin may name `?userId=`; service must | — | cities with computed stocks and garrison (`src/server.ts:440`) |
@@ -129,8 +131,10 @@ everything else 401s without a bearer token.
 | `POST` | `/v1/fleets` | owner | **required** | launch: settle-and-charge lift + cargo, decrement garrison, route the lattice; refused on aegis, sealed season, missing Breaker (`src/server.ts:533`) |
 | `GET` | `/v1/fleets` | own list; admin/service as cities | — | fleets, cargo as decimal strings (`src/server.ts:616`) |
 | `GET` | `/v1/fleets/:id` | owner, admin, or service reader | — | one fleet (`src/server.ts:634`) |
+| `GET` | `/v1/battles` | owner (the fleets-list pattern) | a player's battle history, both sides, stored outcomes and digests — never recomputed |
 | `GET` | `/v1/battles/:id` | participants, admin, service reader — **anyone once the season sealed** | — | the immutable report with its digest (`src/server.ts:649`) |
 | `POST` | `/v1/alliances` | user | — | bind an alliance to an EXISTING community; `communityId` required, never minted (`src/server.ts:715`) |
+| `GET` | `/v1/alliances` | bearer | the world's alliance directory with `mine` marked — which-am-I-in answered by the list itself |
 | `GET` | `/v1/alliances/:id` | user, or service reader | — | members, claims, beacons, shared lanes (`src/server.ts:742`) |
 | `POST` | `/v1/alliances/:id/members` | user (self) | join replays | one banner per player per world (`src/server.ts:752`) |
 | `DELETE` | `/v1/alliances/:id/members` | user (self) | — | leave (`src/server.ts:765`) |

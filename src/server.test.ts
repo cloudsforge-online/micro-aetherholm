@@ -3,6 +3,7 @@
 // queue routes. The title contract has its own file — titlecontract.test.ts — because it is a
 // contract with another service and deserves its own record.
 
+import { RESEARCH_NODES, buildingCost, buildingDurationSeconds, researchCost, researchDurationSeconds } from './content.ts';
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
@@ -230,6 +231,97 @@ test('server: bob cannot queue in alice\'s city — 403 not_owner', { skip }, as
   assert.equal(refused.status, 403);
   const body = (await refused.json()) as { error: { code: string } };
   assert.equal(body.error.code, 'not_owner');
+});
+
+/* --------------------------------------------------- the reads the client asked for */
+
+test('server: building and research content is public, exact, and mirrors the engine', { skip }, async () => {
+  const b = await fetch(`${base}/v1/content/buildings`);
+  assert.equal(b.status, 200);
+  const buildings = ((await b.json()) as { buildings: Record<string, { baseCost: Record<string, string>; durationSecondsPerLevel: number }> }).buildings;
+  assert.equal(Object.keys(buildings).length, 20);
+  // The served base IS the engine's level-1 charge — one source, no restated arithmetic.
+  const skyhall = buildings['skyhall']!;
+  assert.equal(skyhall.baseCost['aether'], buildingCost('skyhall', 1).aether.toString());
+  assert.equal(skyhall.durationSecondsPerLevel, buildingDurationSeconds('skyhall', 1));
+
+  const r = await fetch(`${base}/v1/content/research`);
+  const research = ((await r.json()) as { research: Record<string, { branch: string; cost: Record<string, string>; durationSeconds: number }> }).research;
+  assert.equal(Object.keys(research).length, 32);
+  const node = RESEARCH_NODES['economy'][0]!;
+  assert.equal(research[node]!.cost['aether'], researchCost(node).aether.toString());
+  assert.equal(research[node]!.durationSeconds, researchDurationSeconds(node));
+});
+
+test('server: a player lists their own battles and nobody else\'s, digests included', { skip }, async () => {
+  const season = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
+  const islands = await listIslands(asDb(sql), season.archipelagoId);
+  // Two battles for Alice (one as defender), one for Bob alone — fixture rows, since resolution
+  // itself is proven elsewhere and this read serves STORED truth only.
+  // battles_fleet_uniq is phase 2's race floor — one battle per fleet — so each fixture battle
+  // gets its own fleet, which is exactly what the constraint exists to demand.
+  const mk = async (attacker: string, defender: string, n: number) => {
+    const fleet = await sql<{ id: string }[]>`
+      insert into fleets (origin_city_id, user_id, mission, status, target_island_id,
+                          arrives_at, travel_seconds, return_seconds, aether_lift, idempotency_key)
+      values (${home[0]!.id}, ${attacker}, 'raid', 'done', ${islands[0]!.id},
+              now() + interval '1 hour', 3600, 3600, 0, ${'battle-list-fixture-' + n})
+      returning id
+    `;
+    await sql`
+      insert into battles (archipelago_id, island_id, fleet_id, mission, attacker_user_id, defender_user_id,
+                           seed, wind_bp, attacker_oob, defender_oob, result, digest)
+      values (${season.archipelagoId}, ${islands[0]!.id}, ${fleet[0]!.id}, 'raid', ${attacker}, ${defender},
+              1, 0, '{}'::jsonb, '{}'::jsonb, ${sql.json({ outcome: 'raided' })}, ${'ab'.repeat(32)})
+    `;
+  };
+  // A fleet row must exist for the FK; found one? If none, create the minimal ancestry via a city
+  // launch is overkill — insert a fleet directly.
+  const city = await sql`select id, user_id, island_id from cities limit 1`;
+  if (city.length === 0) {
+    // No city yet in this suite ordering: found one for Alice.
+    await fetch(`${base}/v1/cities`, { method: 'POST', headers: auth('alice'),
+      body: JSON.stringify({ islandId: islands[1]!.id, plot: 1, name: 'Historia' }) });
+  }
+  const home = await sql`select id, user_id, island_id from cities limit 1`;
+  await mk(ALICE, BOB, 1);
+  await mk(BOB, ALICE, 2);
+  await mk(BOB, '33333333-3333-4333-8333-333333333333', 3);
+
+  const mine = await fetch(`${base}/v1/battles`, { headers: auth('alice') });
+  assert.equal(mine.status, 200);
+  const battles = ((await mine.json()) as { battles: { attackerUserId: string; defenderUserId: string; digest: string; outcome: string }[] }).battles;
+  assert.equal(battles.length, 2, 'both sides of the war, nobody else\'s');
+  for (const b of battles) {
+    assert.ok(b.attackerUserId === ALICE || b.defenderUserId === ALICE);
+    assert.match(b.digest, /^[0-9a-f]{64}$/);
+    assert.equal(b.outcome, 'raided', 'stored truth, never recomputed');
+  }
+  // The fleets-list owner pattern, verbatim: another user is forbidden without admin.
+  const peek = await fetch(`${base}/v1/battles?userId=${BOB}`, { headers: auth('alice') });
+  assert.equal(peek.status, 403);
+});
+
+test('server: the alliance directory lists the world and marks mine', { skip }, async () => {
+  const founded = await fetch(`${base}/v1/alliances`, {
+    method: 'POST', headers: auth('alice'),
+    body: JSON.stringify({
+      archipelagoId: (await ensureOpenSeason(asDb(sql), 'aetherholm', new Date())).archipelagoId,
+      name: 'Skyward Compact',
+      communityId: '99999999-9999-4999-8999-999999999999',
+    }),
+  });
+  assert.ok(founded.status === 201 || founded.status === 200, `found: ${founded.status}`);
+  const list = await fetch(`${base}/v1/alliances`, { headers: auth('bob') });
+  assert.equal(list.status, 200);
+  const alliances = ((await list.json()) as { alliances: { name: string; memberCount: number; mine: boolean }[] }).alliances;
+  const mine = alliances.find((a) => a.name === 'Skyward Compact');
+  assert.ok(mine, 'the directory lists what was founded');
+  assert.equal(mine!.mine, false, 'bob is not in it');
+  const asAlice = await fetch(`${base}/v1/alliances`, { headers: auth('alice') });
+  const own = ((await asAlice.json()) as { alliances: { name: string; mine: boolean }[] }).alliances
+    .find((a) => a.name === 'Skyward Compact');
+  assert.equal(own!.mine, true, 'which-am-I-in is answered by the directory itself');
 });
 
 /* ------------------------------------------------------------------ phase 2 surfaces */

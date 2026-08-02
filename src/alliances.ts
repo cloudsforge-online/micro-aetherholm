@@ -106,6 +106,41 @@ export async function foundAlliance(
   }
 }
 
+/** One row of the alliance directory: enough to choose one, not the full view. */
+export interface AllianceSummary {
+  readonly id: string;
+  readonly name: string;
+  readonly memberCount: number;
+  readonly mine: boolean;
+}
+
+/**
+ * The alliance directory for one archipelago, with the caller's own membership marked.
+ *
+ * micro-aetherholm-web found the gap: only `GET /v1/alliances/:id` existed, so a client could
+ * neither browse alliances nor answer "which am I in" — a player had to be handed an id out of
+ * band. `mine` is computed here rather than by a second request, because "which am I in" is the
+ * question the screen opens with.
+ */
+export async function listAlliances(
+  sql: Db,
+  archipelagoId: string,
+  viewerUserId: string | null,
+): Promise<AllianceSummary[]> {
+  const rows = await sql<{ id: string; name: string; member_count: number; mine: boolean }[]>`
+    select a.id, a.name,
+           (select count(*)::int from alliance_members m where m.alliance_id = a.id) as member_count,
+           exists (
+             select 1 from alliance_members m
+              where m.alliance_id = a.id and m.user_id = ${viewerUserId}
+           ) as mine
+      from alliances a
+     where a.archipelago_id = ${archipelagoId}
+     order by member_count desc, a.created_at asc
+  `;
+  return rows.map((r) => ({ id: r.id, name: r.name, memberCount: r.member_count, mine: r.mine }));
+}
+
 export async function getAlliance(sql: Db, allianceId: string): Promise<AllianceView | null> {
   const rows = await sql<
     {
