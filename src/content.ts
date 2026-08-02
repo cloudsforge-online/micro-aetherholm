@@ -2,10 +2,12 @@
  * The phase-1 content contract: building types, research nodes, costs, rates and caps.
  *
  * The COUNTS are the contract — 20 buildings, 32 research nodes in 4 branches of 8
- * (docs/ecosystem/20-aetherholm.md §4) — and `content.test.ts` pins them. The full trees
- * (prerequisite edges, per-level curves, art) live in `micro-aetherholm-assets` when that
- * repository exists, following the Emberkin pattern of content JSON driving both the engine and
- * the art prompts. What lives here is the minimum the phase-1 economy genuinely executes:
+ * (docs/ecosystem/20-aetherholm.md §4) — and `content.test.ts` pins them. THE INVERSION IS
+ * FINAL: doc 20 planned the canonical trees in the assets repository, but phases 1–2 built them
+ * here and `micro-aetherholm-assets` now derives its art prompts FROM this file (its `plan.ts`
+ * imports it and asserts the counts before spending a unit). This file is the canon; two content
+ * sources is the drift defect the estate keeps paying for, and the assets repo's README §2
+ * records the same decision from its side. What lives here is what the economy executes:
  * which buildings produce, which building caps storage, and what a queue item costs.
  *
  * **Every amount is `bigint`.** Resources are not Shards — no Shard is ever held by this service —
@@ -186,7 +188,7 @@ export function storageCapFor(levels: ReadonlyMap<BuildingType, number>): bigint
 /* ------------------------------------------------------------------ costs and durations */
 
 /** Base cost of level 1, scaled linearly by the level being built. Deliberately simple: the real
- *  curves are content, and content lives in the assets repository when phase 4 writes it. */
+ *  curves are content, and THIS file is where content lives — the assets repo reads it. */
 const BUILDING_BASE_COST: Stocks = Object.freeze({
   aether: 20n,
   cloudstone: 60n,
