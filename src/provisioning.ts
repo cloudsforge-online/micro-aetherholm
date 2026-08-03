@@ -19,6 +19,11 @@
  * a shield you can buy is pay-for-power on the defensive axis (20-aetherholm.md §4).
  */
 
+import {
+  titleUrn,
+  type ProvisionRequest,
+  type ProvisionResult,
+} from '@cloudsforge/contracts-worlds';
 import { SKERRY_ISLAND_COUNT, generateIslands, skerrySeed } from './world.ts';
 import { insertIslands, isUniqueViolation } from './seasons.ts';
 import { ensureLattice } from './lattice.ts';
@@ -36,23 +41,27 @@ export class UnsupportedSkuError extends Error {
   }
 }
 
-export interface ProvisionInput {
-  readonly entitlementId: string;
-  readonly subject: string;
-  readonly userId: string;
-  readonly sku: string;
-  readonly scope: string;
-  readonly metadata: Readonly<Record<string, unknown>>;
-  readonly correlationId: string;
-}
+/**
+ * The bridge's request and answer, from `@cloudsforge/contracts-worlds`.
+ *
+ * These were `ProvisionInput` and `ProvisionOutcome`, declared here — and `ProvisionRequest` and
+ * `ProvisionResult`, declared field-for-field identically at `worlds/src/titleclient.ts:56-74`. Two
+ * repositories held one shape under two names, agreeing only because one author wrote both within a
+ * week. The aliases are kept so the rest of this service reads unchanged, but the shape now has one
+ * definition, in the package both halves import.
+ */
+export type ProvisionInput = ProvisionRequest;
+export type ProvisionOutcome = ProvisionResult;
 
-export interface ProvisionOutcome {
-  readonly urn: string;
-  readonly replayed: boolean;
-}
-
+/**
+ * `cf:aetherholm:skerry:<id>`, built by the contract rather than by a template literal here.
+ *
+ * The literal was correct and unchecked. `titleUrn` is the same four segments with a parser beside
+ * it (`parseTitleUrn`), so an ill-formed urn is caught at the boundary rather than stored and
+ * pointed at for ever — a 2xx carrying a bad urn is the failure worlds cannot detect.
+ */
 function urnOf(archipelagoId: string): string {
-  return `cf:aetherholm:skerry:${archipelagoId}`;
+  return titleUrn({ title: 'aetherholm', kind: 'skerry', id: archipelagoId });
 }
 
 /**

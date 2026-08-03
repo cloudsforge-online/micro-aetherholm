@@ -29,6 +29,16 @@ import type { Server } from 'node:http';
 import type postgres from 'postgres';
 import { Lifecycle, postgresProbe } from '@cloudsforge/lifecycle';
 import { TokenError, type Principal } from '@cloudsforge/auth';
+import {
+  PROVISION_REQUEST_FIELDS,
+  isCapability,
+  parseProvisionResult,
+  parseTitleDescriptor,
+  parseTitleUrn,
+  provisionIdempotencyKey,
+  serialiseProvisionRequest,
+  type ProvisionRequest,
+} from '@cloudsforge/contracts-worlds';
 import { createServer, TITLE_DESCRIPTOR, type PrincipalVerifier } from './server.ts';
 import { SKERRY_ISLAND_COUNT } from './world.ts';
 import { SKERRY_PROVISIONED_TOPIC } from './provisioning.ts';
@@ -216,6 +226,99 @@ test('contract 5-6: a provision returns a urn; provisioning twice returns the SA
   `;
   assert.equal(events[0]!.n, 1, 'the replay must not emit a second provisioned event');
 });
+
+/* ═══════════════════════════════════════════════════════════════════════════════════════════
+ * The contract package, driven SENDER THROUGH TO RECEIVER.
+ *
+ * Everything above restates worlds' shapes as literals with citations, which catches a drift only
+ * as long as someone keeps the literals up to date. This drives the actual bytes: the request body
+ * is built by `serialiseProvisionRequest` — the function worlds' bridge calls — and the answer is
+ * read by `parseProvisionResult`, the function worlds' bridge reads it with. Nothing in between is
+ * hand-written, so a rename on either side moves the keys and this goes red.
+ *
+ * That is the property `contracts-worlds` exists for, and the one a types-only package cannot
+ * provide: `ProvisionRequest` and `ProvisionInput` were structurally identical types in two
+ * repositories and would have typechecked green through any renaming of the wire keys.
+ * ═══════════════════════════════════════════════════════════════════════════════════════════ */
+
+test(
+  'contract: the document worlds SERIALISES is the document this service PARSES, and back',
+  { skip },
+  async () => {
+    const request: ProvisionRequest = {
+      entitlementId: 'ent-contract',
+      subject: `user:${ALICE}`,
+      userId: ALICE,
+      sku: 'private_skerry',
+      scope: 'title:aetherholm-title-id',
+      metadata: { name: 'The Contract' },
+      // Carried as the request id HEADER, never in the body. A receiver that made this a required
+      // body field would 400 every real request from the bridge and would still pass every test
+      // written from the interface — so the serialiser dropping it is load-bearing, and this test
+      // is what holds the two ends to the same asymmetry.
+      correlationId: 'corr-contract',
+    };
+
+    const body = serialiseProvisionRequest(request);
+    assert.deepEqual(
+      Object.keys(body).sort(),
+      [...PROVISION_REQUEST_FIELDS].sort(),
+      'the bridge sends a different set of fields than the contract pins',
+    );
+    assert.ok(!('correlationId' in body), 'the correlation id must not be a body field');
+
+    const res = await fetch(`${base}/v1/provision`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer platform',
+        // provisionIdempotencyKey is the contract's single spelling of the key, derived from the
+        // entitlement id and from nothing else.
+        'idempotency-key': provisionIdempotencyKey(request),
+        'x-request-id': request.correlationId,
+      },
+      body: JSON.stringify(body),
+    });
+    assert.ok(res.status === 200 || res.status === 201, `status ${res.status}`);
+
+    const parsed = parseProvisionResult(await res.json());
+    assert.ok(parsed.ok, `worlds could not read this title's answer: ${
+      parsed.ok ? '' : parsed.errors.join('; ')
+    }`);
+    assert.equal(parsed.value.replayed, false);
+
+    // The urn is not merely a non-empty string: it is a well-formed title urn, which is what makes
+    // it safe to store and point at. An ill-formed one is recorded for ever.
+    const urn = parseTitleUrn(parsed.value.urn);
+    assert.ok(urn.ok, `the urn is not a title urn: ${urn.ok ? '' : urn.errors.join('; ')}`);
+    assert.deepEqual(
+      urn.ok ? { title: urn.value.title, kind: urn.value.kind } : null,
+      { title: 'aetherholm', kind: 'skerry' },
+    );
+  },
+);
+
+test(
+  'contract: every capability this title declares is one worlds actually knows',
+  { skip },
+  async () => {
+    // The typo'd-capability defect, checked against the registry rather than against a literal
+    // restated here. `aetherholm/src/server.ts` used to build this from a bare string array with
+    // nothing to check it against, while worlds held the closed union — the same vocabulary in two
+    // repositories, one of them unchecked. A capability worlds does not know is a claim to sell
+    // something that can be bought and never delivered.
+    const res = await fetch(`${base}/v1/title`);
+    const descriptor = parseTitleDescriptor(await res.json());
+    assert.ok(
+      descriptor.ok,
+      `worlds would refuse this descriptor: ${descriptor.ok ? '' : descriptor.errors.join('; ')}`,
+    );
+    assert.ok(descriptor.value.capabilities.length > 0, 'a title that claims nothing sells nothing');
+    for (const capability of descriptor.value.capabilities) {
+      assert.ok(isCapability(capability), `"${capability}" is not a registered capability`);
+    }
+  },
+);
 
 /* conformance check 5 under a genuine race: two replicas, one entitlement, one skerry. */
 test('contract 5 (race): two concurrent provisions of one entitlement yield one skerry, one urn', { skip }, async () => {

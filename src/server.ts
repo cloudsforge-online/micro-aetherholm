@@ -53,6 +53,18 @@ import {
 } from './cities.ts';
 import { stocksWire, InsufficientStockError } from './economy.ts';
 import { ensureOpenSeason, listIslands, openSeason } from './seasons.ts';
+import {
+  PROVISION_PATH,
+  TITLE_DESCRIPTOR_PATH,
+  UNSUPPORTED_CODE,
+  UNSUPPORTED_STATUS,
+  parseProvisionRequest,
+  provisionScopeFor,
+  serialiseProvisionResult,
+  serialiseTitleDescriptor,
+  type Capability,
+  type TitleDescriptor,
+} from '@cloudsforge/contracts-worlds';
 import { UnsupportedSkuError, provisionSkerry } from './provisioning.ts';
 import { CITY_QUEUE_KIND, FLEET_KIND, cityQueueKey, fleetKey } from './jobs.ts';
 import {
@@ -97,17 +109,34 @@ export interface PrincipalVerifier {
   principal(token: string): Promise<Principal>;
 }
 
+/** This title's slug in worlds' registry — the one place it is spelled. */
+export const TITLE_SLUG = 'aetherholm';
+
 export const READ_SCOPE = 'aetherholm:read';
 export const WRITE_SCOPE = 'aetherholm:write';
-/** The scope worlds' credential must carry to provision. Checked, not assumed — conformance 8/9. */
-export const PROVISION_SCOPE = 'aetherholm:provision';
+/**
+ * The scope worlds' credential must carry to provision. Checked, not assumed — conformance 8/9.
+ *
+ * Derived by the contract rather than spelled here, so a title added tomorrow needs no release of
+ * the package to be callable, and so worlds and this service cannot disagree about the spelling.
+ */
+export const PROVISION_SCOPE = provisionScopeFor(TITLE_SLUG);
 
-/** The descriptor `GET /v1/title` serves. `private_world` is the one capability phase 1 delivers;
- *  declaring more would be the typo'd-capability defect worlds' conformance check 4 exists for. */
-export const TITLE_DESCRIPTOR = Object.freeze({
-  slug: 'aetherholm',
+/**
+ * The descriptor `GET /v1/title` serves. `private_world` is the one capability phase 1 delivers;
+ * declaring more would be the typo'd-capability defect worlds' conformance check 4 exists for.
+ *
+ * **`capabilities` is typed `Capability[]` now, not `string[]`.** It used to be a bare string
+ * literal with nothing to check it against, while `worlds/src/titles.ts:43` held the closed union it
+ * is checked against on arrival — the same vocabulary in two repositories, one of them unchecked.
+ * A typo here was a registration worlds refuses, or worse, a capability claim that is accepted and
+ * silently never delivered: a purchase taken for something this title cannot make. The contract's
+ * union makes the typo a compile error at the end where it is actually made.
+ */
+export const TITLE_DESCRIPTOR: TitleDescriptor = Object.freeze({
+  slug: TITLE_SLUG,
   name: 'Aetherholm',
-  capabilities: Object.freeze(['private_world']),
+  capabilities: Object.freeze<Capability[]>(['private_world']),
 });
 
 export interface ServerDeps {
@@ -281,8 +310,9 @@ async function handle(
     }
     if (err instanceof UnsupportedSkuError) {
       // 422 with code 'unsupported' — the ANSWER worlds' bridge records as terminal
-      // (worlds/src/titleclient.ts:181, worlds/src/conformance.ts check 7).
-      return errorReply(422, 'unsupported', err.message, ctx.requestId);
+      // (worlds/src/titleclient.ts:181, worlds/src/conformance.ts check 7). Both halves of that
+      // agreement are now the contract's constants rather than a literal at each end.
+      return errorReply(UNSUPPORTED_STATUS, UNSUPPORTED_CODE, err.message, ctx.requestId);
     }
     if (err instanceof NotFoundError) return errorReply(404, 'not_found', err.message, ctx.requestId);
     if (err instanceof NotOwnerError) return errorReply(403, 'not_owner', err.message, ctx.requestId);
@@ -345,9 +375,15 @@ function buildRoutes(): Route[] {
 
     /* --------------------------------------------------------------- the title contract */
 
-    define('GET', '/v1/title', async () => ({ status: 200, body: TITLE_DESCRIPTOR })),
+    // Both paths come from the contract, so this service cannot serve a route worlds does not
+    // call. That is the exact failure the achievement bridge suffered in the other direction: two
+    // title clients POSTed `/internal/achievements` for months and worlds never served it.
+    define('GET', TITLE_DESCRIPTOR_PATH, async () => ({
+      status: 200,
+      body: serialiseTitleDescriptor(TITLE_DESCRIPTOR),
+    })),
 
-    define('POST', '/v1/provision', async (ctx, deps) => {
+    define('POST', PROVISION_PATH, async (ctx, deps) => {
       const principal = await authenticate(ctx, deps);
       if (principal.kind !== 'service') {
         // Provisioning is the platform's act, driven by a paid entitlement. A user token here is
@@ -356,35 +392,28 @@ function buildRoutes(): Route[] {
       }
       requireScope(principal, PROVISION_SCOPE);
 
-      const body = await readJson(ctx.req);
-      const entitlementId = requireString(body, 'entitlementId');
-      const subject = requireString(body, 'subject');
-      const userId = requireString(body, 'userId');
-      const sku = requireString(body, 'sku');
-      const scope = requireString(body, 'scope');
-      const metadata =
-        typeof body['metadata'] === 'object' && body['metadata'] !== null && !Array.isArray(body['metadata'])
-          ? (body['metadata'] as Record<string, unknown>)
-          : {};
+      // Parsed by the CONTRACT's parser, not by six hand-written `requireString` calls. The
+      // correlation id is passed in rather than read from the body because it travels as the
+      // request id header and is deliberately not a wire field — a receiver that made it a required
+      // body field would 400 every real request from the bridge and pass every test written from
+      // the interface. That asymmetry is exactly what a types-only package cannot express.
+      const parsed = parseProvisionRequest(await readJson(ctx.req), ctx.requestId);
+      if (!parsed.ok) throw new BadRequestError(parsed.errors.join('; '));
 
       const done = deps.lifecycle.track();
       try {
-        const outcome = await provisionSkerry(deps.sql, deps.producer, {
-          entitlementId,
-          subject,
-          userId,
-          sku,
-          scope,
-          metadata,
-          correlationId: ctx.requestId,
-        });
+        const outcome = await provisionSkerry(deps.sql, deps.producer, parsed.value);
         deps.metrics.increment('aetherholm_provisions_total', {
           outcome: outcome.replayed ? 'replayed' : 'provisioned',
         });
-        ctx.log.info('provisioned', { entitlementId, urn: outcome.urn, replayed: outcome.replayed });
+        ctx.log.info('provisioned', {
+          entitlementId: parsed.value.entitlementId,
+          urn: outcome.urn,
+          replayed: outcome.replayed,
+        });
         return {
           status: outcome.replayed ? 200 : 201,
-          body: { urn: outcome.urn, replayed: outcome.replayed },
+          body: serialiseProvisionResult(outcome),
         };
       } finally {
         done();
