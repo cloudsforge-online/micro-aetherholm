@@ -59,7 +59,6 @@ import {
   UNSUPPORTED_CODE,
   UNSUPPORTED_STATUS,
   parseProvisionRequest,
-  provisionScopeFor,
   serialiseProvisionResult,
   serialiseTitleDescriptor,
   type Capability,
@@ -117,10 +116,18 @@ export const WRITE_SCOPE = 'aetherholm:write';
 /**
  * The scope worlds' credential must carry to provision. Checked, not assumed — conformance 8/9.
  *
- * Derived by the contract rather than spelled here, so a title added tomorrow needs no release of
- * the package to be callable, and so worlds and this service cannot disagree about the spelling.
+ * **A LITERAL on purpose, and it must stay one.** The obvious tidy-up is
+ * `provisionScopeFor(TITLE_SLUG)`, which is where this started; the estate's scope audit rejects it
+ * — "'PROVISION_SCOPE' resolves to no string constant in this repository — fail, do not guess". It
+ * is right to. That audit proves every scope a gate demands exists in `contracts-auth`, so identity
+ * can actually mint it, and a scope it cannot resolve is a gate it cannot check. Making the audit
+ * blind here to make the code prettier would trade a real guarantee for a cosmetic one.
+ *
+ * The agreement with the contract is kept anyway, in `titlecontract.test.ts`, which asserts this
+ * equals `provisionScopeFor(TITLE_SLUG)`. So a drift still fails a test — it just fails it
+ * somewhere the audit can still read this file.
  */
-export const PROVISION_SCOPE = provisionScopeFor(TITLE_SLUG);
+export const PROVISION_SCOPE = 'aetherholm:provision';
 
 /**
  * The descriptor `GET /v1/title` serves. `private_world` is the one capability phase 1 delivers;

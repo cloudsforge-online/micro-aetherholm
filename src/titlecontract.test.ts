@@ -36,10 +36,17 @@ import {
   parseTitleDescriptor,
   parseTitleUrn,
   provisionIdempotencyKey,
+  provisionScopeFor,
   serialiseProvisionRequest,
   type ProvisionRequest,
 } from '@cloudsforge/contracts-worlds';
-import { createServer, TITLE_DESCRIPTOR, type PrincipalVerifier } from './server.ts';
+import {
+  createServer,
+  PROVISION_SCOPE,
+  TITLE_DESCRIPTOR,
+  TITLE_SLUG,
+  type PrincipalVerifier,
+} from './server.ts';
 import { SKERRY_ISLAND_COUNT } from './world.ts';
 import { SKERRY_PROVISIONED_TOPIC } from './provisioning.ts';
 import {
@@ -297,6 +304,16 @@ test(
     );
   },
 );
+
+test('contract: the scope this title gates on is the scope worlds derives for it', () => {
+  // `server.ts` spells PROVISION_SCOPE as a literal deliberately — the estate's scope audit must be
+  // able to resolve it to a string constant to prove identity can mint it, and it fails rather than
+  // guesses at a computed one. This is where the two ends are held together instead: if the
+  // contract's derivation and this service's literal ever disagree, worlds presents a scope this
+  // gate does not accept and every provision 403s.
+  assert.equal(PROVISION_SCOPE, provisionScopeFor(TITLE_SLUG));
+  assert.equal(TITLE_SLUG, TITLE_DESCRIPTOR.slug, 'the title is registered under a different slug');
+});
 
 test(
   'contract: every capability this title declares is one worlds actually knows',
