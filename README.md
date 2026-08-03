@@ -1,7 +1,7 @@
 # micro-aetherholm
 
 The third Forge Worlds title: a sky-island strategy MMO at Ikariam scale
-([docs/ecosystem/20-aetherholm.md] is the design; this repository is its phases 1 and 2). It owns
+([`ecosystem/20-aetherholm.md`] is the design; this repository is its phases 1 and 2). It owns
 the world — seasons with seeds, archipelagos, islands, cities, buildings, build/research/shipyard
 queues, and a **lazy economy with no world tick** — and the moving parts: the **directed wind
 lattice**, fleets and travel, **deterministic battles with sha256-digested reports**, raids and
@@ -245,4 +245,11 @@ serve below it.
 - **`micro-aetherholm-web` and `-assets` do not exist yet** (doc §11, phases 3–4). The chronicle
   routes are the replay browser's data source, ready for the client.
 
-[docs/ecosystem/20-aetherholm.md]: ../docs/ecosystem/20-aetherholm.md
+[`ecosystem/20-aetherholm.md`]: https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/20-aetherholm.md
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
