@@ -38,7 +38,8 @@ import {
 import type { Lifecycle } from '@cloudsforge/lifecycle';
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry';
 import type { JobQueue } from '@cloudsforge/jobs';
-import type { Db } from './outbox.ts';
+import { SIGNATURE_HEADER, verifyEventSignature, withInbox, type Db } from './outbox.ts';
+import { USER_DELETED_TOPIC, eraseUser } from './erasure.ts';
 import {
   IdempotencyConflictError,
   NotFoundError,
@@ -154,8 +155,25 @@ export interface ServerDeps {
   readonly sql: Db;
   readonly producer: string;
   readonly queue: Pick<JobQueue, 'enqueue'>;
+  /**
+   * The secrets `POST /v1/events` will accept, newest first — `env.acceptSecrets`.
+   *
+   * Required rather than optional with a default: an inbound webhook whose credential can be
+   * omitted at the composition root is an inbound webhook that will one day be composed without
+   * one, and the failure is silent until somebody posts an unsigned erasure.
+   */
+  readonly eventAcceptSecrets: readonly string[];
   readonly beforeScrape?: () => Promise<void>;
 }
+
+/**
+ * The topics this service subscribes to.
+ *
+ * Rule 6 of docs/ecosystem/03 §2: every service that stores a `user_id` subscribes to
+ * `identity.user.deleted` and erases. This one stores it in nine places — see src/erasure.ts for
+ * what happens to each and why.
+ */
+const SUBSCRIBED_TOPICS: ReadonlySet<string> = new Set([USER_DELETED_TOPIC]);
 
 export function registerServiceMetrics(metrics: Metrics): Metrics {
   return metrics
@@ -972,6 +990,56 @@ function buildRoutes(): Route[] {
       }
       return { status: 200, body: { battles } };
     }),
+
+    /**
+     * The inbound event webhook — `http://aetherholm:4120/v1/events`.
+     *
+     * The signature is checked over the RAW BYTES before anything is parsed, with the contract's
+     * timing-safe verifier: a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery
+     * oracle, and parsing first means an unauthenticated caller reaches the JSON parser.
+     *
+     * A topic this service does not subscribe to is acknowledged and IGNORED, never 4xx'd — a 4xx
+     * makes the producer's relay retry the same event for ever.
+     */
+    define('POST', '/v1/events', async (ctx, deps) => {
+      const raw = await readRaw(ctx.req);
+      const presented = headerOf(ctx.req, SIGNATURE_HEADER);
+      if (!presented || !verifyEventSignature(raw, deps.eventAcceptSecrets, presented)) {
+        // 403 and not 401: this is not a bearer-token surface, and a 401 would invite the caller
+        // to go and find a token. The MAC is the credential, and it was wrong.
+        return errorReply(403, 'bad_signature', 'the event signature did not verify', ctx.requestId);
+      }
+      let envelope: { id?: unknown; topic?: unknown; payload?: Record<string, unknown> };
+      try {
+        envelope = JSON.parse(raw) as typeof envelope;
+      } catch {
+        throw new BadRequestError('the event body is not valid JSON');
+      }
+      const topic = typeof envelope.topic === 'string' ? envelope.topic : '';
+      const eventId = typeof envelope.id === 'string' ? envelope.id : '';
+      if (!UUID.test(eventId)) throw new BadRequestError('the event id must be a uuid');
+      if (!SUBSCRIBED_TOPICS.has(topic)) return { status: 202, body: { status: 'ignored' } };
+
+      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+        const userId = envelope.payload?.['userId'];
+        if (typeof userId !== 'string' || !UUID.test(userId)) {
+          throw new BadRequestError(`${USER_DELETED_TOPIC} requires a uuid userId`);
+        }
+        return eraseUser(tx, userId);
+      });
+      // Counts only. The erased id is never logged — writing it into the log would recreate, in
+      // the one store nothing erases, exactly what the request was to remove.
+      ctx.log.info('inbound event', {
+        topic,
+        eventId,
+        outcome: outcome.status,
+        ...(outcome.status === 'processed' ? outcome.value : {}),
+      });
+      return {
+        status: 202,
+        body: { status: outcome.status === 'duplicate' ? 'duplicate' : 'recorded' },
+      };
+    }),
   ];
 }
 
@@ -1083,18 +1151,32 @@ function requireString(body: Record<string, unknown>, field: string): string {
   return value.trim();
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+/**
+ * The body as the bytes that arrived.
+ *
+ * Separate from `readJson` because the event webhook must verify a MAC over exactly what was sent
+ * before it parses: re-serialising a parsed object changes key order and whitespace, and the
+ * signature is over the sender's bytes, not over a shape that happens to mean the same thing.
+ */
+async function readRaw(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     const buffer = chunk as Buffer;
     size += buffer.length;
+    // Capped before buffering rather than after: an unbounded body is a memory-exhaustion
+    // primitive, and on this route an unauthenticated caller can reach it.
     if (size > MAX_BODY_BYTES) throw new BadRequestError('request body too large');
     chunks.push(buffer);
   }
-  if (size === 0) return {};
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRaw(req);
+  if (raw.length === 0) return {};
   try {
-    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       throw new BadRequestError('request body must be a JSON object');
     }

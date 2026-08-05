@@ -131,6 +131,39 @@ jobs:
           grep -q 'battles_immutable' src/migrations.ts \
             || { echo '::error::the battles append-only trigger is gone; a battle report could be rewritten'; exit 1; }
 
+      # Rule 6 of docs/ecosystem/03 §2. This service stored a user_id in nine places and erased
+      # none of them on request; a deletion reported success and left every city standing. These
+      # greps are cheap and they are what stops that regressing to silence again.
+      - name: The right to erasure is still wired up, and still one-way
+        run: |
+          grep -q "'identity.user.deleted'" src/erasure.ts \
+            || { echo '::error::the erasure topic is gone; a deletion request would silently do nothing'; exit 1; }
+          grep -q "'/v1/events'" src/server.ts \
+            || { echo '::error::the inbound event webhook is gone; identity.user.deleted cannot be delivered'; exit 1; }
+          grep -q 'SUBSCRIBED_TOPICS' src/server.ts \
+            || { echo '::error::the subscribed-topic set is gone; an unsubscribed topic would 4xx and retry for ever'; exit 1; }
+          grep -q 'aetherholm_erasure_one_way' src/migrations.ts \
+            || { echo '::error::the one-way erasure trigger is gone; an anonymised row could be re-attributed to a person'; exit 1; }
+          grep -q 'archipelagos_owner_subject_shape' src/migrations.ts \
+            || { echo '::error::the erased-owner CHECK is gone; an erased skerry owner is no longer distinguishable from a real one'; exit 1; }
+          grep -q 'chronicles_rewrite_is_declared' src/migrations.ts \
+            || { echo '::error::the chronicle rewrite CHECK is gone; a redacted chronicle could claim to be intact'; exit 1; }
+          grep -q 'digest_at_sealing' src/migrations.ts \
+            || { echo '::error::digest_at_sealing is gone; a redacted chronicle would lose the record of what it used to hash to'; exit 1; }
+
+      # The escape hatch that lets an erasure rewrite frozen history is the one thing in this
+      # repository that can edit a sealed record. It is a flag, so it is a grep — and the count of
+      # places that set it must stay at one, in the handler, where a reviewer will look.
+      - name: Only the erasure handler may unlock immutable history
+        run: |
+          setters=$(grep -rl "set_config('aetherholm.erasure'" src --include='*.ts' \
+                    | grep -v '\.test\.ts$' || true)
+          if [ "$setters" != "src/erasure.ts" ]; then
+            echo "::error::aetherholm.erasure is set outside src/erasure.ts: ${setters:-<nowhere>}"
+            exit 1
+          fi
+          echo 'ok: one setter, in the erasure handler'
+
       - name: This service holds no money
         # There is no balance or Shard column anywhere: the Charter and season pass are billing
         # products, cosmetics are worlds entitlements, resources are game material. A balance

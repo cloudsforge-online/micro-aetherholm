@@ -115,9 +115,21 @@ export function signEvent(body: string, secret: string): string {
   return signDelivery(body, secret)
 }
 
-/** Timing-safety and the freshness window both live in the contract's verifier. */
-export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  return verifyDelivery(body, presented, secret).ok
+/**
+ * Timing-safety and the freshness window both live in the contract's verifier.
+ *
+ * `secrets` takes a LIST as well as a single value, because rotating the estate's shared signing
+ * secret must not require both ends to change in the same instant: an endpoint publishes the new
+ * secret, accepts both for a window, then drops the old one. Looping here instead would compare a
+ * MAC a byte at a time per candidate and re-derive the freshness window per candidate; the
+ * contract's verifier does neither.
+ */
+export function verifyEventSignature(
+  body: string,
+  secrets: string | readonly string[],
+  presented: string,
+): boolean {
+  return verifyDelivery(body, presented, secrets).ok
 }
 
 /* ------------------------------------------------------------------------ relay */

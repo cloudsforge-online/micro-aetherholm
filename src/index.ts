@@ -76,6 +76,7 @@ const server = createServer({
   sql: db,
   producer: SERVICE,
   queue,
+  eventAcceptSecrets: env.acceptSecrets,
   beforeScrape: async () => {
     const stats = await queue.stats();
     metrics.set('jobs_pending', stats.pending);

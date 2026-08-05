@@ -144,6 +144,7 @@ everything else 401s without a bearer token.
 | `GET` | `/v1/chronicle/seasons` | **anonymous** | — | sealed seasons with digests (`src/server.ts:800`) |
 | `GET` | `/v1/chronicle/seasons/:id` | **anonymous** | — | the chronicle summary + digest; 404 unless sealed (`src/server.ts:816`) |
 | `GET` | `/v1/chronicle/seasons/:id/battles` | **anonymous** | — | every battle verbatim — the replay browser's source (`src/server.ts:833`) |
+| `POST` | `/v1/events` | **`cf-signature` HMAC only** — no bearer | the envelope's `id`, via the inbox | inbound events. Signature checked over the raw bytes before parsing; a bad or missing one is **403**, not 401 — the MAC is the credential. An unsubscribed topic is **202 ignored**, never 4xx (`src/server.ts:1004`) |
 
 ## Background work
 
@@ -186,7 +187,33 @@ Phase-1 constraints unchanged (one open season, one city per player per island, 
 | `seasons_sealed_immutable` (trigger) | UPDATE/DELETE on a sealed season, **including un-sealing** | doc §9.5: an error even for a caller holding a connection (`src/migrations.ts:667`) |
 | `chronicles_immutable` (trigger) | rewriting history | the chronicle reads as it sealed (`src/migrations.ts:679`) |
 
+Version 14 adds the right-to-erasure invariants. `src/erasure.ts` carries the table-by-table
+decision and the lawful basis for every row that is kept; these are the parts a handler cannot
+hold, because they have to survive the next bug and the operator with psql:
+
+| Constraint | Refuses | Why here |
+| --- | --- | --- |
+| `archipelagos_owner_subject_shape` | an owner that is neither `user:…` nor the exact erased form | a random uuid is indistinguishable from a real one, so the erased state has to be legible in the value (`src/migrations.ts:745`) |
+| `aetherholm_erasure_one_way` (trigger, on `cities`, `fleets`, `alliances`, `alliance_claims`) | writing a person's id back into an anonymised column, or clearing the marker | re-attribution turns an anonymisation into a pseudonymisation (`src/migrations.ts:754`) |
+| `aetherholm_erased_subject_one_way` (trigger, on `archipelagos`, `provisions`) | the same, for the two text-spelled identity columns | (`src/migrations.ts:770`) |
+| `battles_immutable` (rewritten) | everything it did before — **plus** any erasure that touches a column the digest is taken over, or re-erases a side | the exception is enumerated, so a redacted battle provably still hashes to the digest it was born with (`src/migrations.ts:832`) |
+| `chronicles_rewrite_is_declared` | a chronicle that was redacted without recording what it used to hash to | a sealed season may degrade honestly; it may not lie about being intact (`src/migrations.ts:891`) |
+| `chronicles_immutable` (rewritten) | everything it did before, plus an "erasure" that does not count itself exactly once or that re-dates the season | (`src/migrations.ts:894`) |
+
+Both frozen tables are unlocked only by `set_config('aetherholm.erasure', 'on', true)` —
+transaction-local, set in exactly one place (`src/erasure.ts`), and CI fails the build if a second
+setter appears.
+
 ## Events
+
+Consumer of one topic: **`identity.user.deleted`**, on `POST /v1/events` — rule 6 of
+`docs/ecosystem/03 §2`. This service stores a `user_id` in nine tables and the erasure decides each
+one separately, because `battles → fleets → cities` is a chain of `not null` foreign keys with no
+cascade and a battle is two-sided: the other commander is a living person with their own right to a
+coherent record. `src/erasure.ts`'s header is the decision table — delete, anonymise or retain, and
+the Art. 17(3) basis wherever a row is kept. `src/erasure.test.ts` sweeps every base table in the
+schema for the raw uuid afterwards, which is the assertion that catches the column nobody
+remembered.
 
 Producer of eight registered topics (`contracts/packages/events`): the phase-1 five plus
 `aetherholm.battle.resolved` (keyed `battle_id` — the payload names BOTH parties; the defender is
@@ -197,7 +224,11 @@ signing copy.
 
 ## Configuration
 
-Unchanged from phase 1: no upstream URL, no service token, no new variables. Every variable is
+One optional variable joins phase 1's set: `OUTBOX_ACCEPT_SECRETS`, the comma-separated list of
+secrets `POST /v1/events` will accept, newest first. Unset means "only `OUTBOX_SIGNING_SECRET`",
+so a deploy that has never rotated is unaffected — which is what turns rotating the estate's shared
+signing secret into a service-by-service change rather than a flag day. There is still no upstream
+URL and no service token. Every variable is
 declared in `src/env.ts` and `.env.example` agrees; CI compares the two.
 
 | Variable | Default | If wrong |

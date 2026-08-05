@@ -47,6 +47,32 @@ test('env: a short secret is refused (entropy proxy)', () => {
   assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'short' }), EnvError);
 });
 
+test('env: the event accept list defaults to the signing secret, and takes a rotation pair', () => {
+  // Unset means "accept what we sign with", so shipping the inbound webhook is a no-op for a
+  // deploy that has never rotated — which is what makes rotating it later service-by-service.
+  assert.deepEqual(loadEnv(BASE).acceptSecrets, [BASE['OUTBOX_SIGNING_SECRET']]);
+
+  const rotating = loadEnv({
+    ...BASE,
+    OUTBOX_ACCEPT_SECRETS: `the-new-secret-of-sufficient-length, ${BASE['OUTBOX_SIGNING_SECRET']}`,
+  });
+  assert.deepEqual(rotating.acceptSecrets, [
+    'the-new-secret-of-sufficient-length',
+    BASE['OUTBOX_SIGNING_SECRET'],
+  ]);
+});
+
+test('env: one weak secret in the accept list is still a weak secret', () => {
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${BASE['OUTBOX_SIGNING_SECRET']},changeme` }),
+    (err) => err instanceof EnvError && /placeholder/.test(err.message),
+  );
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_ACCEPT_SECRETS: `${BASE['OUTBOX_SIGNING_SECRET']},short` }),
+    EnvError,
+  );
+});
+
 test('env: a nonsense port is refused rather than truncated', () => {
   assert.throws(() => loadEnv({ ...BASE, PORT: '99999999' }), EnvError);
   assert.throws(() => loadEnv({ ...BASE, PORT: 'not-a-port' }), EnvError);

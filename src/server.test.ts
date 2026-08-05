@@ -29,6 +29,7 @@ import {
   testMetrics,
   ALICE,
   BOB,
+  TEST_EVENT_SECRET,
 } from './testsupport.ts';
 
 let sql: postgres.Sql;
@@ -73,6 +74,7 @@ before(async () => {
     sql: asDb(sql),
     producer: 'aetherholm',
     queue,
+    eventAcceptSecrets: [TEST_EVENT_SECRET],
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   lifecycle.markReady();

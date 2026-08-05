@@ -17,6 +17,14 @@ import type { Db } from './outbox.ts';
 export const ALICE = '11111111-1111-4111-8111-111111111111';
 export const BOB = '22222222-2222-4222-8222-222222222222';
 
+/**
+ * The signing secret every test server accepts on `POST /v1/events`.
+ *
+ * Declared once here rather than per file, so a test that means to sign a delivery correctly and a
+ * test that means to forge one cannot accidentally agree by both using a local literal.
+ */
+export const TEST_EVENT_SECRET = 'a-test-event-signing-secret-000000';
+
 const url = process.env['AETHERHOLM_TEST_DATABASE_URL'];
 
 export const enabled = Boolean(url && /test/i.test(url));

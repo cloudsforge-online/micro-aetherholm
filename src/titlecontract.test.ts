@@ -60,6 +60,7 @@ import {
   stripComments,
   testMetrics,
   ALICE,
+  TEST_EVENT_SECRET,
 } from './testsupport.ts';
 
 /** worlds/src/conformance.ts:99 — the slug rule, restated. */
@@ -102,6 +103,7 @@ before(async () => {
     sql: asDb(sql),
     producer: 'aetherholm',
     queue: { enqueue: async () => {} },
+    eventAcceptSecrets: [TEST_EVENT_SECRET],
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   lifecycle.markReady();

@@ -66,6 +66,31 @@ function optional(source: Source, name: string, fallback: string): string {
   return value && value.length > 0 ? value : fallback;
 }
 
+/**
+ * A comma-separated secret list, newest first, with the placeholder rule applied to every entry.
+ *
+ * One weak secret in an accept list is a weak secret, so the check that guards a single value
+ * guards every value here too — an accept list is exactly where a "just for the rotation" filler
+ * would otherwise get in.
+ */
+function secretList(source: Source, name: string, fallback: string): readonly string[] {
+  const raw = optional(source, name, fallback);
+  const values = raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  if (values.length === 0) throw new EnvError(`${name} is set but lists no secrets`);
+  for (const value of values) {
+    if (PLACEHOLDERS.has(value.toLowerCase())) {
+      throw new EnvError(`${name} lists a known placeholder — generate a real secret`);
+    }
+    if (value.length < 24) {
+      throw new EnvError(`${name} lists a secret shorter than 24 characters`);
+    }
+  }
+  return Object.freeze(values);
+}
+
 function integer(source: Source, name: string, fallback: number, min: number, max: number): number {
   const raw = source[name]?.trim();
   if (!raw) return fallback;
@@ -88,6 +113,14 @@ export interface Env {
   readonly identityIssuer: string;
   /** HMAC key for outbound event signatures. */
   readonly outboxSigningSecret: string;
+  /**
+   * The secrets `POST /v1/events` will ACCEPT, newest first.
+   *
+   * Defaults to `[outboxSigningSecret]` when `OUTBOX_ACCEPT_SECRETS` is unset, so a deploy that
+   * never sets it behaves exactly as one that cannot rotate. That default is what lets the shared
+   * signing secret be rotated one service at a time instead of on a flag day.
+   */
+  readonly acceptSecrets: readonly string[];
   readonly instanceId: string;
 }
 
@@ -98,6 +131,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   if (!LEVELS.has(logLevel)) {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`);
   }
+  const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET');
 
   return {
     // 4120, and `.env.example` must agree — CI compares the two, because two repos in this estate
@@ -110,7 +144,8 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'AETHERHOLM_DATABASE_POOL_MAX', 10, 1, 100),
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret,
+    acceptSecrets: secretList(source, 'OUTBOX_ACCEPT_SECRETS', outboxSigningSecret),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
   };
 }
