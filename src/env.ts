@@ -8,8 +8,10 @@
  *
  * Two behaviours are deliberate estate house style:
  *   1. A missing variable names itself (rather than surfacing as an unreadable driver error later).
- *   2. A known placeholder is refused outright — a default secret that boots is a default secret
- *      that reaches production.
+ *   2. A secret that is not SHAPED like a generated one is refused outright — a placeholder that
+ *      boots is a placeholder that reaches production. The rule is `@cloudsforge/secrets`, shared
+ *      with the whole estate, and it replaced a per-service deny-list that could not fail: see
+ *      `requiredSigningSecret` below and micro-org #142.
  *
  * There is deliberately no upstream URL and no service token here. Phase 1 of this title makes no
  * outbound HTTP call: the title contract is INBOUND (worlds calls `POST /v1/provision` with its own
@@ -19,6 +21,7 @@
  */
 
 import { hostname } from 'node:os';
+import { assertGeneratedSecret, assertGeneratedSecretList, SecretError } from '@cloudsforge/secrets';
 
 /** This service's own name. A constant — a property of the repository, not the deployment. */
 export const SERVICE = 'aetherholm';
@@ -30,18 +33,6 @@ export class EnvError extends Error {
   }
 }
 
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change_me',
-  'change-me',
-  'placeholder',
-  'secret',
-  'token',
-  'dev-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-]);
-
 type Source = Readonly<Record<string, string | undefined>>;
 
 function required(source: Source, name: string): string {
@@ -50,13 +41,43 @@ function required(source: Source, name: string): string {
   return value;
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * `@cloudsforge/secrets` raises `SecretError`; this file's contract is that `loadEnv` raises
+ * `EnvError`, and every test and caller in this repository is written to that.
+ *
+ * So the shape failures are re-wrapped rather than rethrown, and the message is carried across
+ * VERBATIM: it already names the variable and the command that fixes it, and by construction it
+ * contains no part of the value. Only the class changes, so there is one thing to catch here and
+ * nothing to re-derive by matching on text.
+ */
+function asEnvError(err: unknown): never {
+  throw err instanceof SecretError ? new EnvError(err.message) : err;
+}
+
+/**
+ * The estate's shared event-bus HMAC key, held to a SHAPE rather than to a deny-list.
+ *
+ * The `requiredSecret` this replaced could not fail. It refused a fixed list of exact strings and
+ * anything under 24 characters, and the value that sat on 54 lines of a PUBLIC compose file —
+ * `estate-only-outbox-secret-00000000000000` — was on no list and was 40 characters, so it passed
+ * every service in the estate (micro-org #142). A check that cannot fail is worse than no check,
+ * because the absence of an alarm gets read as the absence of a problem.
+ *
+ * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
+ * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
+ * keystrokes, and a measured Shannon entropy floor. It has no NODE_ENV exemption and no escape
+ * hatch, so CI generates a real value per run rather than being let through.
+ *
+ * `required` rather than a length check first, deliberately: the weaker checks are a strict subset
+ * of the stronger ones, and running them first would answer a 40-character placeholder with "must
+ * be at least 24 characters" — true, useless, and pointing the operator at the wrong property.
+ */
+function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name);
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`);
-  }
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`);
+  try {
+    assertGeneratedSecret(name, value);
+  } catch (err) {
+    asEnvError(err);
   }
   return value;
 }
@@ -67,26 +88,28 @@ function optional(source: Source, name: string, fallback: string): string {
 }
 
 /**
- * A comma-separated secret list, newest first, with the placeholder rule applied to every entry.
+ * A comma-separated secret list, newest first, with EVERY entry held to the bar a scalar is.
  *
- * One weak secret in an accept list is a weak secret, so the check that guards a single value
- * guards every value here too — an accept list is exactly where a "just for the rotation" filler
- * would otherwise get in.
+ * A list is not a place where the rule relaxes. In a rotation's overlap window the OUTGOING key is
+ * the one an attacker already holds if it leaked, and "just for the drain" is exactly how a
+ * placeholder survives the rotation that was supposed to remove it — so an accept list is the
+ * likeliest place for a filler to get in, not the safest.
+ *
+ * The fallback is the signing secret, which has already cleared the same gate: a deploy that has
+ * never rotated behaves exactly as one that cannot.
  */
-function secretList(source: Source, name: string, fallback: string): readonly string[] {
+function signingSecretList(source: Source, name: string, fallback: string): readonly string[] {
   const raw = optional(source, name, fallback);
   const values = raw
     .split(',')
     .map((value) => value.trim())
     .filter((value) => value.length > 0);
-  if (values.length === 0) throw new EnvError(`${name} is set but lists no secrets`);
-  for (const value of values) {
-    if (PLACEHOLDERS.has(value.toLowerCase())) {
-      throw new EnvError(`${name} lists a known placeholder — generate a real secret`);
-    }
-    if (value.length < 24) {
-      throw new EnvError(`${name} lists a secret shorter than 24 characters`);
-    }
+  try {
+    // Empty throws here too, and must: this list is what `POST /v1/events` verifies against, and a
+    // list of nothing is a webhook nothing can authenticate.
+    assertGeneratedSecretList(name, values);
+  } catch (err) {
+    asEnvError(err);
   }
   return Object.freeze(values);
 }
@@ -131,7 +154,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   if (!LEVELS.has(logLevel)) {
     throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`);
   }
-  const outboxSigningSecret = requiredSecret(source, 'OUTBOX_SIGNING_SECRET');
+  const outboxSigningSecret = requiredSigningSecret(source, 'OUTBOX_SIGNING_SECRET');
 
   return {
     // 4120, and `.env.example` must agree — CI compares the two, because two repos in this estate
@@ -145,7 +168,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
     identityIssuer: required(source, 'IDENTITY_ISSUER'),
     outboxSigningSecret,
-    acceptSecrets: secretList(source, 'OUTBOX_ACCEPT_SECRETS', outboxSigningSecret),
+    acceptSecrets: signingSecretList(source, 'OUTBOX_ACCEPT_SECRETS', outboxSigningSecret),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
   };
 }
