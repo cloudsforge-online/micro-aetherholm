@@ -2,7 +2,7 @@
  * The title contract's write half: provision a Private Skerry.
  *
  * This is the first implementation in the estate of the contract `worlds` actually calls —
- * `worlds/src/titleclient.ts:134-151` POSTs `/v1/provision` with the entitlement id as both the
+ * `worlds/src/titleclient.ts` POSTs `/v1/provision` with the entitlement id as both the
  * `Idempotency-Key` header and a body field, and `worlds/src/conformance.ts` is the executable
  * statement of what this module must satisfy. The three answers it can give, in worlds' own
  * vocabulary:
@@ -10,7 +10,7 @@
  *   - 2xx with a urn        — provisioned (`replayed: true` when the entitlement was seen before;
  *                             the SAME urn both times, conformance check 5, THE ONE THAT MATTERS).
  *   - 422 `unsupported`     — an ANSWER, not a fault: a SKU this title does not sell. Terminal at
- *                             the bridge, never retried (titleclient.ts:19-24).
+ *                             the bridge, never retried (titleclient.ts).
  *   - anything else         — worlds treats it as "we do not know whether it provisioned" and
  *                             retries with the same entitlement id, which the unique absorbs.
  *
@@ -45,7 +45,7 @@ export class UnsupportedSkuError extends Error {
  * The bridge's request and answer, from `@cloudsforge/contracts-worlds`.
  *
  * These were `ProvisionInput` and `ProvisionOutcome`, declared here — and `ProvisionRequest` and
- * `ProvisionResult`, declared field-for-field identically at `worlds/src/titleclient.ts:56-74`. Two
+ * `ProvisionResult`, declared field-for-field identically at `worlds/src/titleclient.ts`. Two
  * repositories held one shape under two names, agreeing only because one author wrote both within a
  * week. The aliases are kept so the rest of this service reads unchanged, but the shape now has one
  * definition, in the package both halves import.

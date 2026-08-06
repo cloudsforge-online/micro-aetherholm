@@ -10,7 +10,7 @@ lattice**, fleets and travel, **deterministic battles with sha256-digested repor
 sieges, **seasons that seal into an immutable chronicle**, and alliances bound to
 `micro-community`. It is also the first service in the estate to implement the title contract
 `worlds` actually calls: `GET /v1/title` and `POST /v1/provision`
-(`worlds/src/titleclient.ts:122`, `:134`), provisioning a **Private Skerry** idempotently on the
+(`worlds/src/titleclient.ts`), provisioning a **Private Skerry** idempotently on the
 entitlement id.
 
 > **What it refuses.** This service holds no money: there is no balance or Shard column anywhere,
@@ -28,23 +28,23 @@ entitlement id.
 
 ## The title contract
 
-Worlds registers a title as a row (`POST /v1/titles`, operator route — `worlds/src/server.ts:484`)
+Worlds registers a title as a row (`POST /v1/titles`, operator route — `worlds/src/server.ts`)
 and its provisioning bridge then drives everything through two calls. The descriptor answers
-`slug: 'aetherholm'` with `capabilities: ['private_world']` (`src/server.ts:70-74`).
+`slug: 'aetherholm'` with `capabilities: ['private_world']` (`src/server.ts`).
 
 **`private_world`, deliberately not `provision`.** Worlds' capability set is closed —
 `'private_world' | 'cosmetics' | 'achievements' | 'seasons' | 'inventory'`
-(`worlds/src/titles.ts:43-51`) — its conformance suite fails any capability outside it
+(`worlds/src/titles.ts`) — its conformance suite fails any capability outside it
 (`worlds/src/conformance.ts` check 4), and the bridge asks `hasCapability(title, 'private_world')`
-before calling at all (`worlds/src/provisioning.ts:441`). A title declaring `provision` would
+before calling at all (`worlds/src/provisioning.ts`). A title declaring `provision` would
 never be called and would fail conformance.
 
 Provisioning is idempotent **on the entitlement id** — the one value stable across redelivery,
-retry and replica takeover (`worlds/src/titleclient.ts:12-17`). The replay returns the **same
+retry and replica takeover (`worlds/src/titleclient.ts`). The replay returns the **same
 urn** with `replayed: true`; a race between two replicas resolves at
 `provisions_entitlement_uniq`. An unknown SKU answers `422 {error:{code:'unsupported'}}`, which
-the bridge records as a terminal answer rather than retrying (`worlds/src/titleclient.ts:19-24`).
-The only SKU sold is `private_skerry` (`src/provisioning.ts:30`): a 12-island private archipelago
+the bridge records as a terminal answer rather than retrying (`worlds/src/titleclient.ts`).
+The only SKU sold is `private_skerry` (`src/provisioning.ts`): a 12-island private archipelago
 whose geography — islands, **lanes and spires** — is derived from `sha256(entitlementId)`, so even
 a hypothetical double-create could not mint two geographies for one purchase (`src/world.ts`
 `skerrySeed`).
@@ -113,38 +113,38 @@ everything else 401s without a bearer token.
 
 | Method | Path | Who | Idempotency-Key | What it does |
 | --- | --- | --- | --- | --- |
-| `GET` | `/livez` | anyone | — | static liveness (`src/server.ts:312`) |
-| `GET` | `/readyz` | anyone | — | Postgres hard, JWKS soft (`src/server.ts:314`) |
-| `GET` | `/metrics` | anyone | — | Prometheus text (`src/server.ts:319`) |
-| `GET` | `/v1/title` | anyone | — | the title descriptor; a capability statement (`src/server.ts:334`) |
-| `POST` | `/v1/provision` | service with `aetherholm:provision` only | dedupe on the body's `entitlementId` | provision a Private Skerry — islands, lanes and spires; unknown SKU is 422 `unsupported` (`src/server.ts:336`) |
-| `GET` | `/v1/seasons/current` | user, or service with `aetherholm:read` | — | the open season, seed as a decimal string (`src/server.ts:382`) |
-| `GET` | `/v1/archipelagos/:id/islands` | user, or service with `aetherholm:read` | — | islands with free plot counts (`src/server.ts:401`) |
-| `GET` | `/v1/archipelagos/:id/lanes` | user, or service with `aetherholm:read` | — | the wind lattice; the ask backfills a pre-lattice world from its seed (`src/server.ts:518`) |
+| `GET` | `/livez` | anyone | — | static liveness (`src/server.ts`) |
+| `GET` | `/readyz` | anyone | — | Postgres hard, JWKS soft (`src/server.ts`) |
+| `GET` | `/metrics` | anyone | — | Prometheus text (`src/server.ts`) |
+| `GET` | `/v1/title` | anyone | — | the title descriptor; a capability statement (`src/server.ts`) |
+| `POST` | `/v1/provision` | service with `aetherholm:provision` only | dedupe on the body's `entitlementId` | provision a Private Skerry — islands, lanes and spires; unknown SKU is 422 `unsupported` (`src/server.ts`) |
+| `GET` | `/v1/seasons/current` | user, or service with `aetherholm:read` | — | the open season, seed as a decimal string (`src/server.ts`) |
+| `GET` | `/v1/archipelagos/:id/islands` | user, or service with `aetherholm:read` | — | islands with free plot counts (`src/server.ts`) |
+| `GET` | `/v1/archipelagos/:id/lanes` | user, or service with `aetherholm:read` | — | the wind lattice; the ask backfills a pre-lattice world from its seed (`src/server.ts`) |
 | `GET` | `/v1/content/buildings` | none | the 20 building base costs and durations, mirrored from the one source the engine charges from (`src/server.ts`, beside airships) |
 | `GET` | `/v1/content/research` | none | the 32 research nodes with exact costs and durations |
-| `GET` | `/v1/content/airships` | anyone | — | the 10 classes, amounts as decimal strings (`src/server.ts:490`) |
-| `POST` | `/v1/cities` | user (service with `aetherholm:write` + `x-user-id`) | the partial unique IS the idempotency | found a city; refused on a sealed season (`src/server.ts:415`) |
-| `GET` | `/v1/cities` | own list; admin may name `?userId=`; service must | — | cities with computed stocks and garrison (`src/server.ts:440`) |
-| `GET` | `/v1/cities/:id` | owner, admin, or service reader | — | the city, stocks computed at read time; 403 to other players (`src/server.ts:459`) |
-| `POST` | `/v1/cities/:id/buildings` | owner | **required** | settle, charge, queue a building level (`src/server.ts:474`) |
-| `POST` | `/v1/cities/:id/research` | owner | **required** | settle, charge, queue a research node (`src/server.ts:478`) |
-| `POST` | `/v1/cities/:id/ships` | owner | **required** | lay a keel; needs the class's aerodock level (`src/server.ts:482`) |
-| `POST` | `/v1/fleets` | owner | **required** | launch: settle-and-charge lift + cargo, decrement garrison, route the lattice; refused on aegis, sealed season, missing Breaker (`src/server.ts:533`) |
-| `GET` | `/v1/fleets` | own list; admin/service as cities | — | fleets, cargo as decimal strings (`src/server.ts:616`) |
-| `GET` | `/v1/fleets/:id` | owner, admin, or service reader | — | one fleet (`src/server.ts:634`) |
+| `GET` | `/v1/content/airships` | anyone | — | the 10 classes, amounts as decimal strings (`src/server.ts`) |
+| `POST` | `/v1/cities` | user (service with `aetherholm:write` + `x-user-id`) | the partial unique IS the idempotency | found a city; refused on a sealed season (`src/server.ts`) |
+| `GET` | `/v1/cities` | own list; admin may name `?userId=`; service must | — | cities with computed stocks and garrison (`src/server.ts`) |
+| `GET` | `/v1/cities/:id` | owner, admin, or service reader | — | the city, stocks computed at read time; 403 to other players (`src/server.ts`) |
+| `POST` | `/v1/cities/:id/buildings` | owner | **required** | settle, charge, queue a building level (`src/server.ts`) |
+| `POST` | `/v1/cities/:id/research` | owner | **required** | settle, charge, queue a research node (`src/server.ts`) |
+| `POST` | `/v1/cities/:id/ships` | owner | **required** | lay a keel; needs the class's aerodock level (`src/server.ts`) |
+| `POST` | `/v1/fleets` | owner | **required** | launch: settle-and-charge lift + cargo, decrement garrison, route the lattice; refused on aegis, sealed season, missing Breaker (`src/server.ts`) |
+| `GET` | `/v1/fleets` | own list; admin/service as cities | — | fleets, cargo as decimal strings (`src/server.ts`) |
+| `GET` | `/v1/fleets/:id` | owner, admin, or service reader | — | one fleet (`src/server.ts`) |
 | `GET` | `/v1/battles` | owner (the fleets-list pattern) | a player's battle history, both sides, stored outcomes and digests — never recomputed |
-| `GET` | `/v1/battles/:id` | participants, admin, service reader — **anyone once the season sealed** | — | the immutable report with its digest (`src/server.ts:649`) |
-| `POST` | `/v1/alliances` | user | — | bind an alliance to an EXISTING community; `communityId` required, never minted (`src/server.ts:715`) |
+| `GET` | `/v1/battles/:id` | participants, admin, service reader — **anyone once the season sealed** | — | the immutable report with its digest (`src/server.ts`) |
+| `POST` | `/v1/alliances` | user | — | bind an alliance to an EXISTING community; `communityId` required, never minted (`src/server.ts`) |
 | `GET` | `/v1/alliances` | bearer | the world's alliance directory with `mine` marked — which-am-I-in answered by the list itself |
-| `GET` | `/v1/alliances/:id` | user, or service reader | — | members, claims, beacons, shared lanes (`src/server.ts:742`) |
-| `POST` | `/v1/alliances/:id/members` | user (self) | join replays | one banner per player per world (`src/server.ts:752`) |
-| `DELETE` | `/v1/alliances/:id/members` | user (self) | — | leave (`src/server.ts:765`) |
-| `POST` | `/v1/alliances/:id/claims` | member with a city on the island | first banner wins | claim an island; shared lanes follow (`src/server.ts:778`) |
-| `GET` | `/v1/chronicle/seasons` | **anonymous** | — | sealed seasons with digests (`src/server.ts:800`) |
-| `GET` | `/v1/chronicle/seasons/:id` | **anonymous** | — | the chronicle summary + digest; 404 unless sealed (`src/server.ts:816`) |
-| `GET` | `/v1/chronicle/seasons/:id/battles` | **anonymous** | — | every battle verbatim — the replay browser's source (`src/server.ts:833`) |
-| `POST` | `/v1/events` | **`cf-signature` HMAC only** — no bearer | the envelope's `id`, via the inbox | inbound events. Signature checked over the raw bytes before parsing; a bad or missing one is **403**, not 401 — the MAC is the credential. An unsubscribed topic is **202 ignored**, never 4xx (`src/server.ts:1004`) |
+| `GET` | `/v1/alliances/:id` | user, or service reader | — | members, claims, beacons, shared lanes (`src/server.ts`) |
+| `POST` | `/v1/alliances/:id/members` | user (self) | join replays | one banner per player per world (`src/server.ts`) |
+| `DELETE` | `/v1/alliances/:id/members` | user (self) | — | leave (`src/server.ts`) |
+| `POST` | `/v1/alliances/:id/claims` | member with a city on the island | first banner wins | claim an island; shared lanes follow (`src/server.ts`) |
+| `GET` | `/v1/chronicle/seasons` | **anonymous** | — | sealed seasons with digests (`src/server.ts`) |
+| `GET` | `/v1/chronicle/seasons/:id` | **anonymous** | — | the chronicle summary + digest; 404 unless sealed (`src/server.ts`) |
+| `GET` | `/v1/chronicle/seasons/:id/battles` | **anonymous** | — | every battle verbatim — the replay browser's source (`src/server.ts`) |
+| `POST` | `/v1/events` | **`cf-signature` HMAC only** — no bearer | the envelope's `id`, via the inbox | inbound events. Signature checked over the raw bytes before parsing; a bad or missing one is **403**, not 401 — the MAC is the credential. An unsubscribed topic is **202 ignored**, never 4xx (`src/server.ts`) |
 
 ## Background work
 
@@ -153,12 +153,12 @@ resource (`src/jobs.ts` header table).
 
 | Job | Lease key | When | Two replicas |
 | --- | --- | --- | --- |
-| `outbox.relay` | `stream` | every 1s | one relays (`src/jobs.ts:104`) |
-| `season.ensure` | `stream` | every 60s | one opens; the loser conflicts on `seasons_one_open` and reads the winner. Also backfills the open season's lattice and keeps `season.close` armed (`src/jobs.ts:109`) |
-| `city.queue` | `city:<id>` | next completion | the `status='queued'` guard applies each item once (`src/jobs.ts:162`) |
-| `fleet.arrive` | `fleet:<id>` | arrival, then the return leg | the row's `for update` + status guard, and `battles_fleet_uniq` beneath them — §9.3, raced for real in `fleets.test.ts` (`src/jobs.ts:130`) |
-| `siege.resolve` | `plot:<islandId>:<n>` | when a besieger arrives | every battle for a contested plot serialises under ONE lease, in arrival order (`src/jobs.ts:143`) |
-| `season.close` | `season:<id>` | `ends_at` | the season row's `status='open'` guard; then the trigger owns history (`src/jobs.ts:155`) |
+| `outbox.relay` | `stream` | every 1s | one relays (`src/jobs.ts`) |
+| `season.ensure` | `stream` | every 60s | one opens; the loser conflicts on `seasons_one_open` and reads the winner. Also backfills the open season's lattice and keeps `season.close` armed (`src/jobs.ts`) |
+| `city.queue` | `city:<id>` | next completion | the `status='queued'` guard applies each item once (`src/jobs.ts`) |
+| `fleet.arrive` | `fleet:<id>` | arrival, then the return leg | the row's `for update` + status guard, and `battles_fleet_uniq` beneath them — §9.3, raced for real in `fleets.test.ts` (`src/jobs.ts`) |
+| `siege.resolve` | `plot:<islandId>:<n>` | when a besieger arrives | every battle for a contested plot serialises under ONE lease, in arrival order (`src/jobs.ts`) |
+| `season.close` | `season:<id>` | `ends_at` | the season row's `status='open'` guard; then the trigger owns history (`src/jobs.ts`) |
 
 **Re-arms happen after completion, never inside a handler.** A handler that enqueues its own
 `(kind, key)` writes into its own claimed row, which the runner then deletes — the re-arm
@@ -173,19 +173,19 @@ Phase-1 constraints unchanged (one open season, one city per player per island, 
 
 | Constraint | Refuses | Why here |
 | --- | --- | --- |
-| `lanes_directed_uniq` + `lanes_no_self` + `lanes_multiplier_range` | duplicate, degenerate or out-of-domain lanes | racing backfills converge instead of duplicating (`src/migrations.ts:361`) |
-| `city_ships_count_non_negative` | a launch taking ships the garrison lacks | the CHECK behind the guarded UPDATE (`src/migrations.ts:392`) |
-| `fleets_cargo_within_hold` (deferred constraint trigger) | a fleet departing — or returning — with more cargo than its freight holds | capacity lives in composition, so fleets AND fleet_ships are judged together at COMMIT; the SQL holds are pinned against `AIRSHIPS` in `fleets.test.ts` (`src/migrations.ts:507`) |
-| `fleets_key_uniq` | re-charging a retried launch | same idempotency shape as queue_items (`src/migrations.ts:435`) |
-| `battles_fleet_uniq` | a second battle for one arrival | §9.3's structural floor beneath the lease and the status guard (`src/migrations.ts:557`) |
-| `battles_immutable` (trigger) | UPDATE/DELETE on any battle | a report that can be edited is not a report (`src/migrations.ts:574`) |
-| `battles_digest_shape` | a report without its sha256 | the determinism claim is a column, not a habit (`src/migrations.ts:551`) |
-| `alliances_community_uniq` | one community backing two alliances per world | one treasury, one banner (`src/migrations.ts:598`) |
-| `alliance_members_one_per_world` | a player flying two banners | unrepresentable, not policed (`src/migrations.ts:610`) |
-| `alliance_claims` primary key on `island_id` | two claims on one island | the first banner planted wins the race (`src/migrations.ts:615`) |
-| `seasons_sealed_is_dated` | a sealed season without its date | (`src/migrations.ts:633`) |
-| `seasons_sealed_immutable` (trigger) | UPDATE/DELETE on a sealed season, **including un-sealing** | doc §9.5: an error even for a caller holding a connection (`src/migrations.ts:667`) |
-| `chronicles_immutable` (trigger) | rewriting history | the chronicle reads as it sealed (`src/migrations.ts:679`) |
+| `lanes_directed_uniq` + `lanes_no_self` + `lanes_multiplier_range` | duplicate, degenerate or out-of-domain lanes | racing backfills converge instead of duplicating (`src/migrations.ts`) |
+| `city_ships_count_non_negative` | a launch taking ships the garrison lacks | the CHECK behind the guarded UPDATE (`src/migrations.ts`) |
+| `fleets_cargo_within_hold` (deferred constraint trigger) | a fleet departing — or returning — with more cargo than its freight holds | capacity lives in composition, so fleets AND fleet_ships are judged together at COMMIT; the SQL holds are pinned against `AIRSHIPS` in `fleets.test.ts` (`src/migrations.ts`) |
+| `fleets_key_uniq` | re-charging a retried launch | same idempotency shape as queue_items (`src/migrations.ts`) |
+| `battles_fleet_uniq` | a second battle for one arrival | §9.3's structural floor beneath the lease and the status guard (`src/migrations.ts`) |
+| `battles_immutable` (trigger) | UPDATE/DELETE on any battle | a report that can be edited is not a report (`src/migrations.ts`) |
+| `battles_digest_shape` | a report without its sha256 | the determinism claim is a column, not a habit (`src/migrations.ts`) |
+| `alliances_community_uniq` | one community backing two alliances per world | one treasury, one banner (`src/migrations.ts`) |
+| `alliance_members_one_per_world` | a player flying two banners | unrepresentable, not policed (`src/migrations.ts`) |
+| `alliance_claims` primary key on `island_id` | two claims on one island | the first banner planted wins the race (`src/migrations.ts`) |
+| `seasons_sealed_is_dated` | a sealed season without its date | (`src/migrations.ts`) |
+| `seasons_sealed_immutable` (trigger) | UPDATE/DELETE on a sealed season, **including un-sealing** | doc §9.5: an error even for a caller holding a connection (`src/migrations.ts`) |
+| `chronicles_immutable` (trigger) | rewriting history | the chronicle reads as it sealed (`src/migrations.ts`) |
 
 Version 14 adds the right-to-erasure invariants. `src/erasure.ts` carries the table-by-table
 decision and the lawful basis for every row that is kept; these are the parts a handler cannot
@@ -193,12 +193,12 @@ hold, because they have to survive the next bug and the operator with psql:
 
 | Constraint | Refuses | Why here |
 | --- | --- | --- |
-| `archipelagos_owner_subject_shape` | an owner that is neither `user:…` nor the exact erased form | a random uuid is indistinguishable from a real one, so the erased state has to be legible in the value (`src/migrations.ts:745`) |
-| `aetherholm_erasure_one_way` (trigger, on `cities`, `fleets`, `alliances`, `alliance_claims`) | writing a person's id back into an anonymised column, or clearing the marker | re-attribution turns an anonymisation into a pseudonymisation (`src/migrations.ts:754`) |
-| `aetherholm_erased_subject_one_way` (trigger, on `archipelagos`, `provisions`) | the same, for the two text-spelled identity columns | (`src/migrations.ts:770`) |
-| `battles_immutable` (rewritten) | everything it did before — **plus** any erasure that touches a column the digest is taken over, or re-erases a side | the exception is enumerated, so a redacted battle provably still hashes to the digest it was born with (`src/migrations.ts:832`) |
-| `chronicles_rewrite_is_declared` | a chronicle that was redacted without recording what it used to hash to | a sealed season may degrade honestly; it may not lie about being intact (`src/migrations.ts:891`) |
-| `chronicles_immutable` (rewritten) | everything it did before, plus an "erasure" that does not count itself exactly once or that re-dates the season | (`src/migrations.ts:894`) |
+| `archipelagos_owner_subject_shape` | an owner that is neither `user:…` nor the exact erased form | a random uuid is indistinguishable from a real one, so the erased state has to be legible in the value (`src/migrations.ts`) |
+| `aetherholm_erasure_one_way` (trigger, on `cities`, `fleets`, `alliances`, `alliance_claims`) | writing a person's id back into an anonymised column, or clearing the marker | re-attribution turns an anonymisation into a pseudonymisation (`src/migrations.ts`) |
+| `aetherholm_erased_subject_one_way` (trigger, on `archipelagos`, `provisions`) | the same, for the two text-spelled identity columns | (`src/migrations.ts`) |
+| `battles_immutable` (rewritten) | everything it did before — **plus** any erasure that touches a column the digest is taken over, or re-erases a side | the exception is enumerated, so a redacted battle provably still hashes to the digest it was born with (`src/migrations.ts`) |
+| `chronicles_rewrite_is_declared` | a chronicle that was redacted without recording what it used to hash to | a sealed season may degrade honestly; it may not lie about being intact (`src/migrations.ts`) |
+| `chronicles_immutable` (rewritten) | everything it did before, plus an "erasure" that does not count itself exactly once or that re-dates the season | (`src/migrations.ts`) |
 
 Both frozen tables are unlocked only by `set_config('aetherholm.erasure', 'on', true)` —
 transaction-local, set in exactly one place (`src/erasure.ts`), and CI fails the build if a second
@@ -233,10 +233,10 @@ declared in `src/env.ts` and `.env.example` agrees; CI compares the two.
 
 | Variable | Default | If wrong |
 | --- | --- | --- |
-| `AETHERHOLM_DATABASE_URL` | — | refuses to start, naming the variable (`src/env.ts:109`) |
+| `AETHERHOLM_DATABASE_URL` | — | refuses to start, naming the variable (`src/env.ts`) |
 | `IDENTITY_JWKS_URL` / `IDENTITY_ISSUER` | — | every authenticated route answers 503, never 401 |
-| `OUTBOX_SIGNING_SECRET` | — | refuses to start; placeholders and short strings refused too (`src/env.ts:113`) |
-| `PORT` | `4120` (`src/env.ts:105`) | the registry row in `micro-ui` pins this value against this file |
+| `OUTBOX_SIGNING_SECRET` | — | refuses to start; placeholders and short strings refused too (`src/env.ts`) |
+| `PORT` | `4120` (`src/env.ts`) | the registry row in `micro-ui` pins this value against this file |
 | `AETHERHOLM_DATABASE_POOL_MAX` | 10 | pool exhaustion or Postgres exhaustion |
 | `LOG_LEVEL`, `NODE_ENV`, `CLOUDSFORGE_TAG`, `INSTANCE_ID` | `info` / `development` / `dev` / hostname | cosmetic to fatal-log routing |
 
@@ -271,7 +271,7 @@ serve below it.
 - **Ship queue completions emit no event** — a hull joining its own harbour is the player's plan
   proceeding, not news; the battles it fights are.
 - **Registration is an operator act.** This service does not self-register with worlds at boot;
-  an operator posts the row (`worlds/src/server.ts:484`) and runs worlds' conformance suite
+  an operator posts the row (`worlds/src/server.ts`) and runs worlds' conformance suite
   against it first.
 - **The well/strain system (doc §2) is not implemented** — no storm grounding, no strain
   mechanics; the well meeting is still ahead. Research effects remain recorded, not applied.

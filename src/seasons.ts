@@ -220,7 +220,7 @@ export interface IslandSummary {
   /**
    * Whether this island is an Aether Spire — the victory objective the whole season contests.
    * The column has existed since the lattice migration (`migrations.ts`, maintained at
-   * `lattice.ts:80`) and this summary never selected it, so no client could mark a spire on any
+   * `lattice.ts`) and this summary never selected it, so no client could mark a spire on any
    * map: the one thing doc 20 §5 says the archipelago screen must show. Found by
    * micro-aetherholm-web building that screen.
    */

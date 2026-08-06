@@ -4,7 +4,7 @@
  * Rule 4 of docs/ecosystem/03 §2: `/livez`, `/readyz` and `/metrics` on every service, or it does
  * not pass CI.
  *
- * Two routes ARE the title contract `worlds` calls (worlds/src/titleclient.ts:122, :134):
+ * Two routes ARE the title contract `worlds` calls (worlds/src/titleclient.ts, :134):
  *
  *   `GET  /v1/title`      — the descriptor. Public and unauthenticated: it is a capability
  *                           statement, not data, and worlds' conformance suite reads it before
@@ -135,7 +135,7 @@ export const PROVISION_SCOPE = 'aetherholm:provision';
  * declaring more would be the typo'd-capability defect worlds' conformance check 4 exists for.
  *
  * **`capabilities` is typed `Capability[]` now, not `string[]`.** It used to be a bare string
- * literal with nothing to check it against, while `worlds/src/titles.ts:43` held the closed union it
+ * literal with nothing to check it against, while `worlds/src/titles.ts` held the closed union it
  * is checked against on arrival — the same vocabulary in two repositories, one of them unchecked.
  * A typo here was a registration worlds refuses, or worse, a capability claim that is accepted and
  * silently never delivered: a purchase taken for something this title cannot make. The contract's
@@ -335,7 +335,7 @@ async function handle(
     }
     if (err instanceof UnsupportedSkuError) {
       // 422 with code 'unsupported' — the ANSWER worlds' bridge records as terminal
-      // (worlds/src/titleclient.ts:181, worlds/src/conformance.ts check 7). Both halves of that
+      // (worlds/src/titleclient.ts, worlds/src/conformance.ts check 7). Both halves of that
       // agreement are now the contract's constants rather than a literal at each end.
       return errorReply(UNSUPPORTED_STATUS, UNSUPPORTED_CODE, err.message, ctx.requestId);
     }

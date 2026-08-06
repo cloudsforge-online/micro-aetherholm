@@ -9,11 +9,11 @@
 //
 //   - `GET /v1/title` must answer a JSON object whose `slug` is a string and whose
 //     `capabilities` is an array, or worlds' client throws
-//     ("a title descriptor must carry a slug and capabilities", worlds/src/titleclient.ts:123-125).
+//     ("a title descriptor must carry a slug and capabilities", worlds/src/titleclient.ts).
 //   - `POST /v1/provision` receives {entitlementId, subject, userId, sku, scope, metadata} with
-//     the entitlement id repeated as the Idempotency-Key header (worlds/src/titleclient.ts:139-150)
+//     the entitlement id repeated as the Idempotency-Key header (worlds/src/titleclient.ts)
 //     and must answer a non-empty string `urn`; `replayed` is read as `=== true`
-//     (worlds/src/titleclient.ts:153-159).
+//     (worlds/src/titleclient.ts).
 //
 // Slug and capability validity are pinned against worlds' OWN rules, restated as literals with
 // citations — the surfaces.test.ts BOUND-table technique: a second independent copy, so a drift
@@ -63,9 +63,9 @@ import {
   TEST_EVENT_SECRET,
 } from './testsupport.ts';
 
-/** worlds/src/conformance.ts:99 — the slug rule, restated. */
+/** worlds/src/conformance.ts — the slug rule, restated. */
 const WORLDS_SLUG_RULE = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/;
-/** worlds/src/titles.ts:45-51 — the closed capability set, restated. 'provision' is NOT in it. */
+/** worlds/src/titles.ts — the closed capability set, restated. 'provision' is NOT in it. */
 const WORLDS_KNOWN_CAPABILITIES = ['private_world', 'cosmetics', 'achievements', 'seasons', 'inventory'];
 
 let sql: postgres.Sql;
@@ -117,8 +117,8 @@ after(async () => {
   if (sql) await sql.end();
 });
 
-/** The provision body exactly as worlds' bridge sends it (worlds/src/titleclient.ts:139-146,
- *  fed by worlds/src/provisioning.ts:454-462) — plus the Idempotency-Key header it always adds. */
+/** The provision body exactly as worlds' bridge sends it (worlds/src/titleclient.ts,
+ *  fed by worlds/src/provisioning.ts) — plus the Idempotency-Key header it always adds. */
 function provisionRequest(entitlementId: string, overrides: Record<string, unknown> = {}) {
   return {
     method: 'POST',
@@ -139,18 +139,18 @@ function provisionRequest(entitlementId: string, overrides: Record<string, unkno
   };
 }
 
-/* conformance check 1 — worlds/src/conformance.ts:143-149 */
+/* conformance check 1 — worlds/src/conformance.ts */
 test('contract 1: the title answers /livez', { skip }, async () => {
   assert.equal((await fetch(`${base}/livez`)).status, 200);
 });
 
-/* conformance checks 2, 3, 4 — worlds/src/conformance.ts:151-178 */
+/* conformance checks 2, 3, 4 — worlds/src/conformance.ts */
 test('contract 2-4: GET /v1/title describes the title; the slug and capabilities pass worlds\' own rules', { skip }, async () => {
   const res = await fetch(`${base}/v1/title`);
   assert.equal(res.status, 200);
   const body = (await res.json()) as { slug?: unknown; name?: unknown; capabilities?: unknown };
 
-  // worlds/src/titleclient.ts:123 — the two fields the client refuses to live without.
+  // worlds/src/titleclient.ts — the two fields the client refuses to live without.
   assert.equal(typeof body.slug, 'string');
   assert.ok(Array.isArray(body.capabilities));
 
@@ -160,7 +160,7 @@ test('contract 2-4: GET /v1/title describes the title; the slug and capabilities
   // Every declared capability must be one worlds knows (conformance check 4) — a typo'd
   // capability is a purchase accepted and never delivered. In particular this is why the
   // descriptor says 'private_world' and NOT 'provision': the bridge asks hasCapability(title,
-  // 'private_world') before calling at all (worlds/src/provisioning.ts:441-451).
+  // 'private_world') before calling at all (worlds/src/provisioning.ts).
   for (const capability of body.capabilities as unknown[]) {
     assert.ok(
       WORLDS_KNOWN_CAPABILITIES.includes(capability as string),
@@ -171,7 +171,7 @@ test('contract 2-4: GET /v1/title describes the title; the slug and capabilities
   assert.deepEqual(body, { ...TITLE_DESCRIPTOR, capabilities: ['private_world'] });
 });
 
-/* conformance check 8 — worlds/src/conformance.ts:180-201 */
+/* conformance check 8 — worlds/src/conformance.ts */
 test('contract 8: an unauthenticated provision is refused with 401', { skip }, async () => {
   const request = provisionRequest('ent-unauth');
   const res = await fetch(`${base}/v1/provision`, {
@@ -183,7 +183,7 @@ test('contract 8: an unauthenticated provision is refused with 401', { skip }, a
   assert.equal(rows[0]!.n, 0, 'nothing may be provisioned for an unauthenticated caller');
 });
 
-/* conformance check 9 — worlds/src/conformance.ts:203-219 */
+/* conformance check 9 — worlds/src/conformance.ts */
 test('contract 9: a credential this platform did not issue is refused; presence is not enough', { skip }, async () => {
   const forged = await fetch(`${base}/v1/provision`, {
     ...provisionRequest('ent-forged'),
@@ -205,12 +205,12 @@ test('contract 9: a credential this platform did not issue is refused; presence 
   assert.equal(player.status, 403);
 });
 
-/* conformance checks 5 and 6 — worlds/src/conformance.ts:221-250. THE ONE THAT MATTERS. */
+/* conformance checks 5 and 6 — worlds/src/conformance.ts. THE ONE THAT MATTERS. */
 test('contract 5-6: a provision returns a urn; provisioning twice returns the SAME urn, replayed', { skip }, async () => {
   const first = await fetch(`${base}/v1/provision`, provisionRequest('ent-1'));
   assert.ok(first.status === 200 || first.status === 201, `status ${first.status}`);
   const b1 = (await first.json()) as { urn?: unknown; replayed?: unknown };
-  // worlds/src/titleclient.ts:153-157 — a 2xx with no urn is treated as an outage.
+  // worlds/src/titleclient.ts — a 2xx with no urn is treated as an outage.
   assert.equal(typeof b1.urn, 'string');
   assert.ok((b1.urn as string).length > 0);
   assert.match(b1.urn as string, /^cf:aetherholm:skerry:/, 'the urn names what was created');
@@ -220,7 +220,7 @@ test('contract 5-6: a provision returns a urn; provisioning twice returns the SA
   assert.ok(second.status === 200 || second.status === 201);
   const b2 = (await second.json()) as { urn?: unknown; replayed?: unknown };
   assert.equal(b2.urn, b1.urn, 'a second urn would be a SECOND world for one purchase');
-  // worlds reads replayed strictly as `=== true` (titleclient.ts:159).
+  // worlds reads replayed strictly as `=== true` (titleclient.ts).
   assert.equal(b2.replayed, true);
 
   // One skerry, its islands, one provision row, one event.
@@ -354,7 +354,7 @@ test('contract 5 (race): two concurrent provisions of one entitlement yield one 
   assert.equal(skerries[0]!.n, 1);
 });
 
-/* conformance check 7 — worlds/src/conformance.ts:252-271 */
+/* conformance check 7 — worlds/src/conformance.ts */
 test('contract 7: an unknown sku is refused with 422 and code unsupported — an ANSWER, not a fault', { skip }, async () => {
   const res = await fetch(
     `${base}/v1/provision`,
@@ -362,8 +362,8 @@ test('contract 7: an unknown sku is refused with 422 and code unsupported — an
   );
   assert.equal(res.status, 422);
   const body = (await res.json()) as { error: { code: string } };
-  // worlds/src/titleclient.ts:181 translates exactly this into TitleUnsupportedError, which the
-  // bridge records as a TERMINAL 'unsupported' row rather than retrying (provisioning.ts:465-467).
+  // worlds/src/titleclient.ts translates exactly this into TitleUnsupportedError, which the
+  // bridge records as a TERMINAL 'unsupported' row rather than retrying (provisioning.ts).
   assert.equal(body.error.code, 'unsupported');
   const rows = await sql<{ n: number }[]>`select count(*)::int as n from archipelagos`;
   assert.equal(rows[0]!.n, 0);
