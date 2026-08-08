@@ -255,9 +255,20 @@ serve below it.
 
 ## Known gaps, recorded rather than implied
 
-- **Heraldry consumption is not wired in worlds.** This service emits `spire.captured` and
-  `season.sealed` faithfully; nothing in `worlds` subscribes yet, so the entitlement grant is an
-  event with no consumer. That wiring belongs to worlds and is out of this repository's remit.
+- **Heraldry consumption is wired in worlds — this gap has closed.** It is recorded here rather
+  than deleted, because what closed it is worth knowing. This service emits
+  `aetherholm.spire.captured` and `aetherholm.season.sealed` faithfully (`src/sealing.ts` declares
+  both literals), and the seal is no longer shouted into an empty room: `worlds/src/server.ts`
+  dispatches on `SEASON_SEALED_TOPIC` — the same string, declared independently in
+  `worlds/src/heraldry.ts` — and mints the victors' heraldry onto the shared cross-title profile.
+  It does so through its own inbox, so a redelivered seal grants nothing twice, and it fans an
+  alliance victory out to every uuid on `victor.userIds` because worlds holds no alliance table
+  and must not grow one to render a reward — which is exactly why `src/sealing.ts` puts the
+  membership on the wire. Worlds' own comment calls it "the event this consumer was missing for a
+  full phase". `spire.captured` has a consumer too, though a different one: notify's catalogue
+  notifies each victor from that payload rather than broadcasting. The boundary is unchanged and
+  still the point — the entitlement grant is worlds' to make, and this repository's remit ends at
+  emitting an event worlds can trust.
 - **The alliance's `communityId` is stored, not verified.** This service makes no outbound call
   (by design — `src/env.ts` explains), so a fabricated uuid buys an alliance whose governance
   simply does not exist. The moment governance is exercised, community is the authority; a
@@ -275,8 +286,24 @@ serve below it.
   against it first.
 - **The well/strain system (doc §2) is not implemented** — no storm grounding, no strain
   mechanics; the well meeting is still ahead. Research effects remain recorded, not applied.
-- **`micro-aetherholm-web` and `-assets` do not exist yet** (doc §11, phases 3–4). The chronicle
-  routes are the replay browser's data source, ready for the client.
+- **`micro-aetherholm-web` and `-assets` exist and the client is routed; what it cannot yet show
+  is the remaining gap** (doc §11, phases 3–4). Both repositories are real, and the web surface
+  is live at the gateway rather than merely built: `deploy/compose/docker-compose.gateway.yml` has
+  `aetherholm${CF_WEB_SUFFIX}` in the alias list of hostnames a browser opens, and
+  `deploy/gateway/dynamic/policy.yml` lists `https://aetherholm{{ env "CF_WEB_SUFFIX" }}` among the
+  origins sign-in may return to — an origin missing from that second list gets a client that
+  loads and can never complete a handoff, so both entries are needed and both are present. The
+  honest qualifier is what a stranger sees. Four of the client's six routes (`/`, `/cities`,
+  `/fleets`, `/alliance` in `aetherholm-web/src/app.tsx`) sit behind `ProtectedRoute`, so the apex
+  sends an anonymous visitor to sign-in. `/chronicle` is public by design and does consume
+  `GET /v1/chronicle/seasons` from this service, but it renders "No season has finished", because
+  `SEASON_DAYS` in `src/seasons.ts` is 120 and no season has reached its closing day — the one
+  anonymous page in the title is empty for a reason that is calendar, not code. `/battles` is
+  public too, and its "Your battles" section relays this service's own
+  `a valid bearer token is required` (`src/server.ts`) verbatim to a reader who has no token; a
+  sealed season's reports open without one, and there are no sealed seasons. So the chronicle
+  routes are still the replay browser's data source, but the browser is no longer what is
+  missing — a sealed season is.
 
 [`ecosystem/20-aetherholm.md`]: https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/20-aetherholm.md
 
