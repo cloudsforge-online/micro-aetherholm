@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/aetherholm",
-  "version": "2.5.3",
+  "version": "2.5.4",
   "private": true,
   "description": "The third Forge Worlds title. Aetherholm is a sky-island strategy MMO: seeded archipelagos, one city per player per island made unrepresentable by the schema, lazy resource accrual with no world tick, leased build/research queues — and the first implementation of the title contract worlds actually calls (GET /v1/title, POST /v1/provision), provisioning a Private Skerry idempotently on the entitlement id. No money is held here; cosmetics and passes live in billing and worlds, and the aegis cannot be purchased.",
   "license": "MIT",
