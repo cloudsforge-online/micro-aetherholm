@@ -135,6 +135,84 @@ test('server: the season and its islands read back; a service needs aetherholm:r
   assert.equal(refused.status, 403);
 });
 
+/**
+ * The pair micro-org#332 was opened about: a skerry that is bought must be findable by the person
+ * who bought it. Written as ONE journey deliberately — provision through the real contract route,
+ * then read through the user route, then dereference the id it hands back — because the defect was
+ * never in either half alone. `POST /v1/provision` worked; the buyer simply had nowhere to learn
+ * the id it had minted. So the assertion that matters is the last one: the id from this list is
+ * accepted by /v1/archipelagos/:id/islands.
+ */
+async function provision(entitlementId: string, subject: string, name: string): Promise<void> {
+  const res = await fetch(`${base}/v1/provision`, {
+    method: 'POST',
+    headers: { ...auth('platform'), 'idempotency-key': entitlementId },
+    body: JSON.stringify({
+      entitlementId,
+      subject: `user:${subject}`,
+      userId: subject,
+      sku: 'private_skerry',
+      scope: 'title:aetherholm-title-id',
+      metadata: { name },
+    }),
+  });
+  assert.equal(res.status, 201, `provision ${entitlementId}: ${res.status}`);
+}
+
+test('server: a buyer lists the skerries they own and can open one', { skip }, async () => {
+  // A public season exists throughout: its archipelago is owned by nobody, and must not appear in
+  // anybody's list. That is the whole difference between this route and /v1/seasons/current.
+  const season = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
+  await provision('ent-332-a', ALICE, 'The Gullery');
+  await provision('ent-332-b', ALICE, 'Windward Rock');
+  await provision('ent-332-c', BOB, 'The Cormorant');
+
+  const mine = await fetch(`${base}/v1/archipelagos`, { headers: auth('alice') });
+  assert.equal(mine.status, 200);
+  const owned = ((await mine.json()) as {
+    archipelagos: { id: string; kind: string; name: string; urn: string; createdAt: string }[];
+  }).archipelagos;
+  assert.equal(owned.length, 2, "both of alice's skerries, and nobody else's, and not the season");
+  assert.deepEqual(
+    owned.map((a) => a.name).sort(),
+    ['The Gullery', 'Windward Rock'],
+    'the name the buyer chose at purchase is what names the world back to them',
+  );
+  for (const a of owned) {
+    assert.equal(a.kind, 'skerry');
+    assert.equal(a.urn, `cf:aetherholm:skerry:${a.id}`, 'the urn worlds was told, not one re-derived');
+    assert.ok(!Number.isNaN(Date.parse(a.createdAt)));
+  }
+  assert.ok(
+    !owned.some((a) => a.id === season.archipelagoId),
+    'the public season world has no owner and belongs to no list',
+  );
+
+  // The point of the whole route: an id from here is an id the rest of the surface accepts.
+  const islands = await fetch(`${base}/v1/archipelagos/${owned[0]!.id}/islands`, {
+    headers: auth('alice'),
+  });
+  assert.equal(islands.status, 200);
+  assert.equal(((await islands.json()) as { islands: unknown[] }).islands.length, 12);
+
+  // The cities/battles owner pattern, verbatim: another player's list needs admin, a service must
+  // name whose list it wants, and the provision scope is not a read scope.
+  assert.equal((await fetch(`${base}/v1/archipelagos?userId=${BOB}`, { headers: auth('alice') })).status, 403);
+  const operator = await fetch(`${base}/v1/archipelagos?userId=${BOB}`, { headers: auth('admin') });
+  assert.equal(operator.status, 200);
+  assert.equal(((await operator.json()) as { archipelagos: unknown[] }).archipelagos.length, 1);
+  assert.equal((await fetch(`${base}/v1/archipelagos`, { headers: auth('reader') })).status, 400);
+  assert.equal(
+    (await fetch(`${base}/v1/archipelagos?userId=${ALICE}`, { headers: auth('reader') })).status,
+    200,
+  );
+  assert.equal(
+    (await fetch(`${base}/v1/archipelagos?userId=${ALICE}`, { headers: auth('platform') })).status,
+    403,
+  );
+  assert.equal((await fetch(`${base}/v1/archipelagos`)).status, 401);
+});
+
 test('server: found a city, read it back with computed stocks, refuse the other player', { skip }, async () => {
   const islandId = await anIsland();
   const create = await fetch(`${base}/v1/cities`, {

@@ -65,7 +65,7 @@ import {
   type Capability,
   type TitleDescriptor,
 } from '@cloudsforge/contracts-worlds';
-import { UnsupportedSkuError, provisionSkerry } from './provisioning.ts';
+import { UnsupportedSkuError, listArchipelagosOwnedBy, provisionSkerry } from './provisioning.ts';
 import { CITY_QUEUE_KIND, FLEET_KIND, cityQueueKey, fleetKey } from './jobs.ts';
 import {
   AIRSHIPS,
@@ -462,6 +462,43 @@ function buildRoutes(): Route[] {
           openedAt: season.openedAt.toISOString(),
           endsAt: season.endsAt.toISOString(),
           archipelagoId: season.archipelagoId,
+        },
+      };
+    }),
+
+    // The user-token sibling of POST /v1/provision: the write mints a world, this names the ones
+    // you own. Without it a buyer held a row nothing could address — every other archipelago route
+    // takes an :id in its path, and the only id any client was ever handed came from
+    // /v1/seasons/current, which is the PUBLIC world (micro-org#332, measured 2026-08-10).
+    //
+    // Declared above /v1/archipelagos/:id/islands only for reading order; the router is
+    // first-match-wins over whole segments, so `/v1/archipelagos` cannot shadow a two-segment path.
+    define('GET', '/v1/archipelagos', async (ctx, deps) => {
+      // The owner pattern of GET /v1/cities and GET /v1/battles, verbatim.
+      const principal = await authenticate(ctx, deps);
+      const requested = ctx.url.searchParams.get('userId') ?? undefined;
+      let ownerId: string;
+      if (principal.kind === 'user') {
+        if (requested && requested !== principal.userId && !isAdmin(principal)) {
+          throw new ForbiddenError('role:admin');
+        }
+        ownerId = requested ?? principal.userId;
+      } else {
+        requireScope(principal, READ_SCOPE);
+        if (!requested) throw new BadRequestError('a service must name a userId');
+        ownerId = requested;
+      }
+      const archipelagos = await listArchipelagosOwnedBy(deps.sql, ownerId);
+      return {
+        status: 200,
+        body: {
+          archipelagos: archipelagos.map((a) => ({
+            id: a.id,
+            kind: a.kind,
+            name: a.name,
+            urn: a.urn,
+            createdAt: a.createdAt.toISOString(),
+          })),
         },
       };
     }),
