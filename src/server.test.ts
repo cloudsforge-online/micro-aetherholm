@@ -219,6 +219,105 @@ test('server: a buyer lists the skerries they own and can open one', { skip }, a
 });
 
 /**
+ * The ORDER of that list, pinned — the one part of #332 nothing was grading.
+ *
+ * The case above sorts the names before comparing them, deliberately, because it is asking WHICH
+ * worlds come back and not in what sequence. That left `order by a.created_at desc, a.id` in
+ * `listArchipelagosOwnedBy` unmeasured: deleting the whole clause on 2026-08-10 kept all 168 tests
+ * green. A clause no test can fail is the defect class this suite exists to catch, so here it is
+ * graded directly.
+ *
+ * It is worth grading because the order is READ BY A PERSON. `aetherholm-web`'s map page renders
+ * this list straight into the world switcher and imposes no order of its own, so whatever arrives
+ * is the menu an owner sees. Unordered, the planner may return a heap in any sequence it likes and
+ * may change its mind after a VACUUM or a plan flip — a menu that reshuffles between two visits,
+ * which is a worse bug than a wrong first row because nothing about it looks broken.
+ *
+ * Two keys, so two assertions:
+ *
+ *   - `created_at desc` is the one a buyer feels. The world they just paid for is the one they
+ *     came to look at.
+ *   - `id` is the tie-break, and it is not decoration. Two entitlements the bridge delivers inside
+ *     one clock tick share a `created_at`, and without a second key such a pair is ordered by
+ *     nothing at all. The tie is manufactured with an UPDATE, because the bridge cannot be asked to
+ *     race on demand and a test that waited for a real race would be a test that usually proves
+ *     nothing.
+ *
+ * ## Why both fixtures are sixteen rows, and this is the whole point of the case
+ *
+ * Both halves were first written with two rows, and BOTH killed their mutation on roughly half of
+ * their runs (measured 2026-08-10, five runs each: two kills, then zero). That is not a proof, it
+ * is a coin flip wearing a green tick — the exact "check that cannot fail" this suite is supposed
+ * to catch, arrived at while writing a check meant to catch one.
+ *
+ * The reason is `gen_random_uuid`. With two rows, `order by a.id` agrees with `created_at desc` at
+ * random half the time, and a tied pair comes back ascending at random half the time, so each
+ * mutant survived whenever the dice said so. Steering the physical layout did not help either:
+ * this query JOINS `provisions`, so the output order belongs to the join algorithm and not to the
+ * heap, and nothing a test does to tuple placement binds it.
+ *
+ * So the fixtures are SIZED rather than steered. Sixteen rows have 16! orderings and exactly one of
+ * them is the one asserted, so a mutant survives about one run in 20,922,789,888,000 instead of one
+ * in two. Sixteen is the smallest round size that buys that; the cap is 100
+ * (`OWNED_ARCHIPELAGO_LIMIT`), so eighteen rows also read back whole and prove the cap is not
+ * trimming the fixture out from under the assertion.
+ *
+ * The sixteen are inserted directly, because this case is about the ORDER BY and not about
+ * provisioning — the case above already drives provisioning through the real route, and the two
+ * real skerries here ride along to prove that provisioned rows sort by the same rule as inserted
+ * ones. `urn` is null on the inserted sixteen and is not read here.
+ *
+ * Mutation-proved 2026-08-10, five runs each, killed on every run: `order by a.id` alone reddens
+ * the newest-first assertion, `order by a.created_at desc` alone reddens the tie-break assertion,
+ * and deleting the clause outright reddens both.
+ */
+test('server: the owner list is ordered newest first, and ties break on id', { skip }, async () => {
+  const read = async (): Promise<{ id: string; name: string }[]> =>
+    (
+      (await (await fetch(`${base}/v1/archipelagos`, { headers: auth('alice') })).json()) as {
+        archipelagos: { id: string; name: string }[];
+      }
+    ).archipelagos;
+
+  // Sixteen worlds a minute apart in 2020, inserted OLDEST FIRST so that insertion order is the
+  // reverse of the order the route owes — an unordered read cannot accidentally agree.
+  const olderAt = (i: number) => new Date(Date.UTC(2020, 0, 1, 0, i)).toISOString();
+  for (let i = 0; i < 16; i += 1) {
+    await sql`
+      insert into archipelagos (kind, owner_subject, entitlement_id, name, seed, created_at)
+      values ('skerry', ${`user:${ALICE}`}, ${`ent-332-order-${i}`}, ${`World ${i}`}, ${i}, ${olderAt(i)})
+    `;
+  }
+  // Two REAL ones on top, through the bridge's own route, so the newest rows in the list are rows
+  // provisioning actually made. They are the newest because `created_at` defaults to now() and the
+  // sixteen above are five years stale.
+  await provision('ent-332-order-a', ALICE, 'First Bought');
+  await provision('ent-332-order-b', ALICE, 'Second Bought');
+
+  const expected = ['Second Bought', 'First Bought'];
+  for (let i = 15; i >= 0; i -= 1) expected.push(`World ${i}`);
+  assert.deepEqual(
+    (await read()).map((a) => a.name),
+    expected,
+    'newest first, all eighteen: the skerry just bought is the one its buyer came looking for',
+  );
+
+  // Now one clock tick for all eighteen, which is what a batch the bridge delivers together looks
+  // like. `created_at desc` has nothing left to say and only the id can order them.
+  await sql`
+    update archipelagos set created_at = timestamptz '2026-08-10 00:00:00+00'
+     where owner_subject = ${`user:${ALICE}`}
+  `;
+  const tied = await read();
+  assert.equal(tied.length, 18, 'the whole fixture came back, so the cap did not trim it');
+  assert.deepEqual(
+    tied.map((a) => a.id),
+    [...tied.map((a) => a.id)].sort(),
+    'with created_at tied the list still has exactly one order, and it is ascending by id',
+  );
+});
+
+/**
  * The other half of #332, over HTTP: the id that route hands out must not be a capability.
  *
  * micro-org#341. `/islands` and `/lanes` authenticated and then asked no further questions, so any
