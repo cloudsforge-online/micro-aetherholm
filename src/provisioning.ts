@@ -1,5 +1,13 @@
 /**
- * The title contract's write half: provision a Private Skerry.
+ * The Private Skerry: the title contract's write half, and the owner's read of what it made.
+ *
+ * The read was missing for as long as the write existed. Measured on 2026-08-10 (micro-org#332):
+ * `POST /v1/provision` had raised skerries since this module landed, every route that can show an
+ * archipelago wants an id in its path, and the only place a client was ever handed one was
+ * `GET /v1/seasons/current` — the PUBLIC season world. So a buyer had a row here, twelve seeded
+ * islands and a wind lattice, and no way to name any of it. `listArchipelagosOwnedBy` at the foot
+ * of this file is that missing half, and it lives here rather than in seasons.ts because the thing
+ * being listed is what provisioning created: a skerry has no season.
  *
  * This is the first implementation in the estate of the contract `worlds` actually calls —
  * `worlds/src/titleclient.ts` POSTs `/v1/provision` with the entitlement id as both the
@@ -144,4 +152,68 @@ async function findByEntitlement(sql: Db, entitlementId: string): Promise<string
     select urn from provisions where entitlement_id = ${entitlementId}
   `;
   return rows[0]?.urn ?? null;
+}
+
+/* --------------------------------------------------------------- the buyer's own list */
+
+/** One archipelago a person owns, as their own list serves it. */
+export interface OwnedArchipelago {
+  readonly id: string;
+  /** `skerry` for everything this can return today: `archipelagos_ownership_coherent` forbids a
+   *  public archipelago from having an owner at all. Carried anyway, because the wire should say
+   *  which kind of world it handed back rather than leave the client to assume. */
+  readonly kind: string;
+  readonly name: string;
+  /**
+   * `cf:aetherholm:skerry:<id>` — the identity the rest of the estate dereferences.
+   *
+   * Nullable because it lives on `provisions`, one join away. Provisioning writes both rows in one
+   * transaction so a real purchase always has it; a row inserted by hand (every fixture in this
+   * repository does exactly that) has not. Answering null is the honest shape for "this world was
+   * not minted through the bridge" — inventing a urn from the id would mint one the bridge never
+   * issued, which is the failure `titleUrn`'s parser exists to make impossible.
+   */
+  readonly urn: string | null;
+  readonly createdAt: Date;
+}
+
+/**
+ * The most worlds one list will name.
+ *
+ * The cap of `GET /v1/battles` (50), for the same reason: an unbounded list is an unbounded
+ * response. Larger than that one because a skerry is a PURCHASE — a list truncated below what
+ * somebody paid for is the worse failure — and one purchase is one row, so a hundred rows is a
+ * hundred entitlements. Nobody in the estate holds one yet (micro-org#332: the entitlement path
+ * has only ever been driven by the bridge and by tests, measured 2026-08-10), so this bounds a
+ * future rather than trims a present.
+ */
+export const OWNED_ARCHIPELAGO_LIMIT = 100;
+
+/**
+ * Every archipelago a person owns, newest first.
+ *
+ * Keyed on `archipelagos.owner_subject`, the LEDGER spelling `user:<uuid>` — the same predicate
+ * `erasure.ts` anonymises by, and the one the `archipelagos_owner_subject_shape` CHECK pins. That
+ * agreement is worth naming: after an erasure the column reads `erased:<uuid>`, so this list stops
+ * returning the row, which is what a right-to-erasure request asked for. Reading `provisions.
+ * user_id` instead would have kept serving the world to an id that had been erased from it.
+ */
+export async function listArchipelagosOwnedBy(sql: Db, userId: string): Promise<OwnedArchipelago[]> {
+  const rows = await sql<
+    { id: string; kind: string; name: string; urn: string | null; created_at: Date }[]
+  >`
+    select a.id, a.kind, a.name, p.urn, a.created_at
+      from archipelagos a
+      left join provisions p on p.archipelago_id = a.id
+     where a.owner_subject = ${`user:${userId}`}
+     order by a.created_at desc, a.id
+     limit ${OWNED_ARCHIPELAGO_LIMIT}
+  `;
+  return rows.map((row) => ({
+    id: row.id,
+    kind: row.kind,
+    name: row.name,
+    urn: row.urn,
+    createdAt: row.created_at,
+  }));
 }

@@ -119,6 +119,7 @@ everything else 401s without a bearer token.
 | `GET` | `/v1/title` | anyone | — | the title descriptor; a capability statement (`src/server.ts`) |
 | `POST` | `/v1/provision` | service with `aetherholm:provision` only | dedupe on the body's `entitlementId` | provision a Private Skerry — islands, lanes and spires; unknown SKU is 422 `unsupported` (`src/server.ts`) |
 | `GET` | `/v1/seasons/current` | user, or service with `aetherholm:read` | — | the open season, seed as a decimal string (`src/server.ts`) |
+| `GET` | `/v1/archipelagos` | own list; admin may name `?userId=`; service must | — | the skerries this subject owns — the user-token half of `POST /v1/provision`, and the only route that hands a buyer the id every other archipelago route asks for (`src/server.ts`) |
 | `GET` | `/v1/archipelagos/:id/islands` | user, or service with `aetherholm:read` | — | islands with free plot counts (`src/server.ts`) |
 | `GET` | `/v1/archipelagos/:id/lanes` | user, or service with `aetherholm:read` | — | the wind lattice; the ask backfills a pre-lattice world from its seed (`src/server.ts`) |
 | `GET` | `/v1/content/buildings` | none | the 20 building base costs and durations, mirrored from the one source the engine charges from (`src/server.ts`, beside airships) |
