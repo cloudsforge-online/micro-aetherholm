@@ -81,6 +81,7 @@ import {
   type Resource,
 } from './content.ts';
 import { ensureLattice } from './lattice.ts';
+import { archipelagoVisibleTo } from './visibility.ts';
 import {
   AegisError,
   InsufficientShipsError,
@@ -508,6 +509,12 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('archipelago id must be a uuid');
+      // The public season world passes; a skerry admits its owner, its guests, an admin and a
+      // service (src/visibility.ts). A refusal is the SAME 404 as an id that names nothing —
+      // micro-org#341: a 403 here would confirm that a stranger's uuid is a real private world.
+      if (!(await archipelagoVisibleTo(deps.sql, id, principal))) {
+        return errorReply(404, 'not_found', 'no such archipelago, or it has no islands', ctx.requestId);
+      }
       const islands = await listIslands(deps.sql, id);
       if (islands.length === 0) {
         return errorReply(404, 'not_found', 'no such archipelago, or it has no islands', ctx.requestId);
@@ -665,6 +672,13 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('archipelago id must be a uuid');
+      // BEFORE ensureLattice, and the order is the whole point. This route WRITES on first touch,
+      // so an unscoped read of a stranger's skerry did not merely observe a paid private world —
+      // asking generated its winds (micro-org#341). The gate has to precede the side effect, and
+      // `visibility.test.ts` asserts the lane count is unchanged after a refused read.
+      if (!(await archipelagoVisibleTo(deps.sql, id, principal))) {
+        return errorReply(404, 'not_found', 'no such archipelago, or it has no lanes', ctx.requestId);
+      }
       // ensureLattice, not listLanes: a phase-1 world grows its winds the first time anyone asks.
       const lanes = await ensureLattice(deps.sql, id);
       if (lanes.length === 0) {

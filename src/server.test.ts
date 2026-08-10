@@ -29,6 +29,7 @@ import {
   testMetrics,
   ALICE,
   BOB,
+  CAROL,
   TEST_EVENT_SECRET,
 } from './testsupport.ts';
 
@@ -40,6 +41,9 @@ let queue: JobQueue;
 /**
  * The verifier fake speaks the estate's Principal vocabulary:
  *   'alice' / 'bob'   — players
+ *   'carol'           — a player who owns nothing and guests nowhere. `admin` IS bob, so bob
+ *                       cannot stand for "a refused stranger" without the test passing for the
+ *                       wrong reason (micro-org#341).
  *   'platform'        — a service token carrying aetherholm:provision (worlds' shape)
  *   'reader'          — a service token with aetherholm:read only
  *   anything else     — TokenError, exactly as a forged JWT fails signature verification
@@ -48,6 +52,7 @@ const verifier: PrincipalVerifier = {
   async principal(token: string): Promise<Principal> {
     if (token === 'alice') return { kind: 'user', userId: ALICE, handle: 'alice', roles: [] };
     if (token === 'bob') return { kind: 'user', userId: BOB, handle: 'bob', roles: [] };
+    if (token === 'carol') return { kind: 'user', userId: CAROL, handle: 'carol', roles: [] };
     if (token === 'admin') {
       return { kind: 'user', userId: BOB, handle: 'op', roles: ['admin'] };
     }
@@ -211,6 +216,54 @@ test('server: a buyer lists the skerries they own and can open one', { skip }, a
     403,
   );
   assert.equal((await fetch(`${base}/v1/archipelagos`)).status, 401);
+});
+
+/**
+ * The other half of #332, over HTTP: the id that route hands out must not be a capability.
+ *
+ * micro-org#341. `/islands` and `/lanes` authenticated and then asked no further questions, so any
+ * subject in the estate holding a skerry's uuid could enumerate its islands — and, because `/lanes`
+ * calls `ensureLattice`, could MAKE its winds by asking. Every assertion below is red against the
+ * 2.5.14 service.
+ */
+test('server: a stranger cannot open, or grow, somebody else’s skerry', { skip }, async () => {
+  const season = await ensureOpenSeason(asDb(sql), 'aetherholm', new Date());
+  await provision('ent-341-http', ALICE, 'The Gannetry');
+  const owned = ((await (await fetch(`${base}/v1/archipelagos`, { headers: auth('alice') })).json()) as {
+    archipelagos: { id: string }[];
+  }).archipelagos;
+  const id = owned[0]!.id;
+
+  const islands = (path: string, token: string) => fetch(`${base}${path}`, { headers: auth(token) });
+
+  // The owner opens it; the operator and a read-scoped service may too.
+  assert.equal((await islands(`/v1/archipelagos/${id}/islands`, 'alice')).status, 200);
+  assert.equal((await islands(`/v1/archipelagos/${id}/islands`, 'admin')).status, 200);
+  assert.equal((await islands(`/v1/archipelagos/${id}/islands`, 'reader')).status, 200);
+
+  // The stranger gets 404, NOT 403: a 403 would confirm the uuid names a real private world, and
+  // an unguessable id whose existence can be confirmed is no longer unguessable in the way that
+  // matters. The body is word-for-word the one an id naming nothing gets.
+  const refused = await islands(`/v1/archipelagos/${id}/islands`, 'carol');
+  assert.equal(refused.status, 404);
+  const missing = await islands('/v1/archipelagos/44444444-4444-4444-8444-444444444444/islands', 'carol');
+  assert.equal(missing.status, 404);
+  assert.deepEqual(
+    ((await refused.json()) as { error: { code: string; message: string } }).error.message,
+    ((await missing.json()) as { error: { code: string; message: string } }).error.message,
+  );
+
+  // And the lanes route, which WRITES. Provisioning seeds the lattice, so the fixture is the world
+  // with its lanes removed — what every archipelago that predates the lattice looks like.
+  await sql`delete from lanes where archipelago_id = ${id}`;
+  assert.equal((await islands(`/v1/archipelagos/${id}/lanes`, 'carol')).status, 404);
+  const after = await sql<{ n: string }[]>`select count(*) as n from lanes where archipelago_id = ${id}`;
+  assert.equal(after[0]!.n, '0', 'a refused GET /lanes generated the wind lattice of a world it refused');
+  assert.equal((await islands(`/v1/archipelagos/${id}/lanes`, 'alice')).status, 200);
+
+  // The season world is untouched by all of this — carol plays there like everybody else.
+  assert.equal((await islands(`/v1/archipelagos/${season.archipelagoId}/islands`, 'carol')).status, 200);
+  assert.equal((await islands(`/v1/archipelagos/${season.archipelagoId}/lanes`, 'carol')).status, 200);
 });
 
 test('server: found a city, read it back with computed stocks, refuse the other player', { skip }, async () => {

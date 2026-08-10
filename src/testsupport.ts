@@ -16,6 +16,15 @@ import type { Db } from './outbox.ts';
 
 export const ALICE = '11111111-1111-4111-8111-111111111111';
 export const BOB = '22222222-2222-4222-8222-222222222222';
+/**
+ * A THIRD player, and the reason there has to be one.
+ *
+ * `server.test.ts`'s admin fake is BOB with `roles: ['admin']`, so BOB can never stand for "a
+ * stranger who is refused" — every refusal test written against him would pass for the wrong
+ * reason the day somebody gave him a skerry. micro-org#341 needs a subject who owns nothing,
+ * guests nowhere and holds no role.
+ */
+export const CAROL = '33333333-3333-4333-8333-333333333333';
 
 /**
  * The signing secret every test server accepts on `POST /v1/events`.
