@@ -8,6 +8,7 @@
 // The rest is the shape of the compromise: what survives an erasure, why it is allowed to, and the
 // database-level guarantees that it can never be turned back into a person.
 
+import { singleNetworkSql } from './server.test.ts'
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
@@ -61,7 +62,8 @@ before(async () => {
     logger: quietLogger(),
     metrics: testMetrics(),
     verifier,
-    sql: asDb(sql),
+    sql: singleNetworkSql(asDb(sql)),
+    singleNetwork: 'mainnet' as const,
     producer: 'aetherholm',
     queue: { enqueue: async () => {} },
     eventAcceptSecrets: [TEST_EVENT_SECRET],

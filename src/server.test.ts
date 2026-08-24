@@ -3,6 +3,7 @@
 // queue routes. The title contract has its own file — titlecontract.test.ts — because it is a
 // contract with another service and deserves its own record.
 
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { RESEARCH_NODES, buildingCost, buildingDurationSeconds, researchCost, researchDurationSeconds } from './content.ts';
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -76,7 +77,8 @@ before(async () => {
     logger: quietLogger(),
     metrics: testMetrics(),
     verifier,
-    sql: asDb(sql),
+    sql: singleNetworkSql(asDb(sql)),
+    singleNetwork: 'mainnet' as const,
     producer: 'aetherholm',
     queue,
     eventAcceptSecrets: [TEST_EVENT_SECRET],
@@ -711,3 +713,12 @@ test('server: an empty treasury is 409 insufficient_stock, and charges nothing',
   const body = (await refused.json()) as { error: { code: string } };
   assert.equal(body.error.code, 'insufficient_stock');
 });
+
+/**
+ * One handle, presented as the per-network selector the server now takes. The fixture runs against
+ * a single test database, so mainnet is the only configured network — which exercises the REFUSAL
+ * path for free: anything reaching for testnet throws rather than reusing this handle.
+ */
+export function singleNetworkSql(db: unknown) {
+  return networkSql({ mainnet: db as RuntimeSql })
+}

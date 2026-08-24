@@ -20,6 +20,7 @@
 // in either repository fails a test instead of a customer.
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 
+import { singleNetworkSql } from './server.test.ts'
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -100,7 +101,8 @@ before(async () => {
     logger: quietLogger(),
     metrics: testMetrics(),
     verifier,
-    sql: asDb(sql),
+    sql: singleNetworkSql(asDb(sql)),
+    singleNetwork: 'mainnet' as const,
     producer: 'aetherholm',
     queue: { enqueue: async () => {} },
     eventAcceptSecrets: [TEST_EVENT_SECRET],

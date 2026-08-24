@@ -35,7 +35,9 @@ import {
   statusFor,
   type Principal,
 } from '@cloudsforge/auth';
-import type { Lifecycle } from '@cloudsforge/lifecycle';
+import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db';
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry';
 import type { JobQueue } from '@cloudsforge/jobs';
 import { SIGNATURE_HEADER, verifyEventSignature, withInbox, type Db } from './outbox.ts';
@@ -153,7 +155,16 @@ export interface ServerDeps {
   readonly logger: Logger;
   readonly metrics: Metrics;
   readonly verifier: PrincipalVerifier;
-  readonly sql: Db;
+  /**
+   * The per-network SELECTOR, not a handle. Routes use `ctx.sql`; `NetworkSql` has no query
+   * methods, so reaching for the process-wide handle does not compile.
+   */
+  readonly sql: NetworkSql
+  /**
+   * The network to assume when no `CF-Network` arrives, or `undefined` to refuse. `CF_NETWORK_SINGLE`,
+   * for `pnpm dev`, which has no gateway in front of it. Never set in production.
+   */
+  readonly singleNetwork?: Network
   readonly producer: string;
   readonly queue: Pick<JobQueue, 'enqueue'>;
   /**
@@ -221,7 +232,34 @@ interface RequestContext {
   readonly requestId: string;
   readonly log: Logger;
   readonly params: Readonly<Record<string, string>>;
+  /**
+   * The network THIS REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * Not a property of the process: one pod serves both estates since the network consolidation
+   * (micro-deploy `docs/network-consolidation.md`), so "which network am I" has no answer.
+   */
+  readonly network: Network;
+  /**
+   * The database handle for `network`, resolved ONCE, at the edge of the request.
+   *
+   * Every route uses this rather than reaching for the process-wide handle, because a wrong handle
+   * is not an error — it is a query that SUCCEEDS against the other estate's rows and says nothing.
+   * `deps.sql` is a `NetworkSql` with no query methods, so the mistake does not compile.
+   */
+  readonly sql: Db;
 }
+
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff —
+ * which is exactly what agora's first build did: 500 on every probe, container never ready.
+ *
+ * A literal SET rather than a prefix, because this is an exemption from a data boundary and
+ * widening it should be a deliberate edit. Every member must answer without touching the database.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
 
 interface Route {
   readonly method: string;
@@ -285,7 +323,7 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1;
     deps.metrics.set('http_requests_in_flight', inFlight);
 
-    const finish = (status: number): void => {
+    const finish = (status: number, metricNetwork: string): void => {
       inFlight -= 1;
       deps.metrics.set('http_requests_in_flight', inFlight);
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
@@ -293,19 +331,53 @@ export function createServer(deps: ServerDeps): Server {
         method,
         route: routeLabel,
         status: String(status),
+        // One target now serves both estates, so the network has to be on the SERIES. Labelled
+        // per target it would say nothing — micro-org#398 in a form nothing could recover.
+        network: metricNetwork,
       });
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel });
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      });
     };
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // ── THE NETWORK, THEN THE HANDLE, BEFORE ANY ROUTE RUNS ──────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet: a 500 is a
+    // routing fault made loud, where a default is a cross-network write nothing would ever flag.
+    //
+    // The operational endpoints are exempt because kubelet and Prometheus do not come through the
+    // gateway and never send the header. Refusing them makes the pod never become ready.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(
+        res,
+        errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId),
+        requestId,
+      )
+      finish(500, 'unknown')
+      return
+    }
+
+    const sql = deps.sql.for(network) as unknown as Db
+    void handle(matched, { req, url, requestId, log, params, network, sql }, deps)
       .then((reply) => {
         send(res, reply, requestId);
-        finish(reply.status);
+        finish(reply.status, network);
       })
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err });
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId);
-        finish(500);
+        finish(500, network);
       });
   });
 }
@@ -428,7 +500,7 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track();
       try {
-        const outcome = await provisionSkerry(deps.sql, deps.producer, parsed.value);
+        const outcome = await provisionSkerry(ctx.sql, deps.producer, parsed.value);
         deps.metrics.increment('aetherholm_provisions_total', {
           outcome: outcome.replayed ? 'replayed' : 'provisioned',
         });
@@ -451,7 +523,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/seasons/current', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps);
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
-      const season = await openSeason(deps.sql);
+      const season = await openSeason(ctx.sql);
       if (!season) return errorReply(404, 'no_open_season', 'no season is open yet', ctx.requestId);
       return {
         status: 200,
@@ -489,7 +561,7 @@ function buildRoutes(): Route[] {
         if (!requested) throw new BadRequestError('a service must name a userId');
         ownerId = requested;
       }
-      const archipelagos = await listArchipelagosOwnedBy(deps.sql, ownerId);
+      const archipelagos = await listArchipelagosOwnedBy(ctx.sql, ownerId);
       return {
         status: 200,
         body: {
@@ -512,10 +584,10 @@ function buildRoutes(): Route[] {
       // The public season world passes; a skerry admits its owner, its guests, an admin and a
       // service (src/visibility.ts). A refusal is the SAME 404 as an id that names nothing —
       // micro-org#341: a 403 here would confirm that a stranger's uuid is a real private world.
-      if (!(await archipelagoVisibleTo(deps.sql, id, principal))) {
+      if (!(await archipelagoVisibleTo(ctx.sql, id, principal))) {
         return errorReply(404, 'not_found', 'no such archipelago, or it has no islands', ctx.requestId);
       }
-      const islands = await listIslands(deps.sql, id);
+      const islands = await listIslands(ctx.sql, id);
       if (islands.length === 0) {
         return errorReply(404, 'not_found', 'no such archipelago, or it has no islands', ctx.requestId);
       }
@@ -535,7 +607,7 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track();
       try {
-        const result = await foundCity(deps.sql, deps.producer, {
+        const result = await foundCity(ctx.sql, deps.producer, {
           userId,
           islandId,
           plot,
@@ -564,7 +636,7 @@ function buildRoutes(): Route[] {
         if (!requested) throw new BadRequestError('a service must name a userId');
         ownerId = requested;
       }
-      const cities = await listCitiesFor(deps.sql, ownerId);
+      const cities = await listCitiesFor(ctx.sql, ownerId);
       return { status: 200, body: { cities } };
     }),
 
@@ -572,7 +644,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps);
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('city id must be a uuid');
-      const city = await getCity(deps.sql, id);
+      const city = await getCity(ctx.sql, id);
       if (!city) return errorReply(404, 'not_found', 'no such city', ctx.requestId);
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
       else if (city.userId !== principal.userId && !isAdmin(principal)) {
@@ -676,11 +748,11 @@ function buildRoutes(): Route[] {
       // so an unscoped read of a stranger's skerry did not merely observe a paid private world —
       // asking generated its winds (micro-org#341). The gate has to precede the side effect, and
       // `visibility.test.ts` asserts the lane count is unchanged after a refused read.
-      if (!(await archipelagoVisibleTo(deps.sql, id, principal))) {
+      if (!(await archipelagoVisibleTo(ctx.sql, id, principal))) {
         return errorReply(404, 'not_found', 'no such archipelago, or it has no lanes', ctx.requestId);
       }
       // ensureLattice, not listLanes: a phase-1 world grows its winds the first time anyone asks.
-      const lanes = await ensureLattice(deps.sql, id);
+      const lanes = await ensureLattice(ctx.sql, id);
       if (lanes.length === 0) {
         return errorReply(404, 'not_found', 'no such archipelago, or it has no lanes', ctx.requestId);
       }
@@ -738,7 +810,7 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track();
       try {
-        const result = await launchFleet(deps.sql, deps.producer, {
+        const result = await launchFleet(ctx.sql, deps.producer, {
           cityId,
           userId,
           mission: mission as Mission,
@@ -786,7 +858,7 @@ function buildRoutes(): Route[] {
         if (!requested) throw new BadRequestError('a service must name a userId');
         ownerId = requested;
       }
-      const fleets = await listFleetsFor(deps.sql, ownerId);
+      const fleets = await listFleetsFor(ctx.sql, ownerId);
       return { status: 200, body: { fleets: fleets.map(wireFleet) } };
     }),
 
@@ -794,7 +866,7 @@ function buildRoutes(): Route[] {
       const principal = await authenticate(ctx, deps);
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('fleet id must be a uuid');
-      const fleet = await getFleet(deps.sql, id);
+      const fleet = await getFleet(ctx.sql, id);
       if (!fleet) return errorReply(404, 'not_found', 'no such fleet', ctx.requestId);
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
       else if (fleet.userId !== principal.userId && !isAdmin(principal)) {
@@ -821,7 +893,7 @@ function buildRoutes(): Route[] {
         if (!requested) throw new BadRequestError('a service must name a userId');
         ownerId = requested;
       }
-      const battles = await listBattlesFor(deps.sql, ownerId, 50);
+      const battles = await listBattlesFor(ctx.sql, ownerId, 50);
       return {
         status: 200,
         body: {
@@ -842,7 +914,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/battles/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('battle id must be a uuid');
-      const rows = await deps.sql<
+      const rows = await ctx.sql<
         {
           id: string;
           archipelago_id: string;
@@ -919,7 +991,7 @@ function buildRoutes(): Route[] {
       }
       const done = deps.lifecycle.track();
       try {
-        const alliance = await foundAlliance(deps.sql, deps.producer, {
+        const alliance = await foundAlliance(ctx.sql, deps.producer, {
           archipelagoId,
           communityId,
           name,
@@ -935,9 +1007,9 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/alliances', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps);
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
-      const season = await ensureOpenSeason(deps.sql, deps.producer, new Date());
+      const season = await ensureOpenSeason(ctx.sql, deps.producer, new Date());
       const viewer = principal.kind === 'user' ? principal.userId : null;
-      const alliances = await listAlliances(deps.sql, season.archipelagoId, viewer);
+      const alliances = await listAlliances(ctx.sql, season.archipelagoId, viewer);
       return { status: 200, body: { alliances } };
     }),
 
@@ -946,7 +1018,7 @@ function buildRoutes(): Route[] {
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE);
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('alliance id must be a uuid');
-      const alliance = await getAlliance(deps.sql, id);
+      const alliance = await getAlliance(ctx.sql, id);
       if (!alliance) return errorReply(404, 'not_found', 'no such alliance', ctx.requestId);
       return { status: 200, body: { alliance } };
     }),
@@ -957,7 +1029,7 @@ function buildRoutes(): Route[] {
       if (!UUID.test(id)) throw new BadRequestError('alliance id must be a uuid');
       const done = deps.lifecycle.track();
       try {
-        await joinAlliance(deps.sql, deps.producer, id, userId);
+        await joinAlliance(ctx.sql, deps.producer, id, userId);
         return { status: 200, body: { joined: true } };
       } finally {
         done();
@@ -970,7 +1042,7 @@ function buildRoutes(): Route[] {
       if (!UUID.test(id)) throw new BadRequestError('alliance id must be a uuid');
       const done = deps.lifecycle.track();
       try {
-        await leaveAlliance(deps.sql, deps.producer, id, userId);
+        await leaveAlliance(ctx.sql, deps.producer, id, userId);
         return { status: 200, body: { left: true } };
       } finally {
         done();
@@ -986,7 +1058,7 @@ function buildRoutes(): Route[] {
       if (!UUID.test(islandId)) throw new BadRequestError('islandId must be a uuid');
       const done = deps.lifecycle.track();
       try {
-        await claimIsland(deps.sql, deps.producer, id, islandId, userId);
+        await claimIsland(ctx.sql, deps.producer, id, islandId, userId);
         return { status: 201, body: { claimed: true } };
       } finally {
         done();
@@ -999,8 +1071,8 @@ function buildRoutes(): Route[] {
     // everything above requires a bearer. The queries themselves are scoped `status = 'sealed'`,
     // so a live season cannot leak through this surface even by id.
 
-    define('GET', '/v1/chronicle/seasons', async (_ctx, deps) => {
-      const seasons = await listChronicles(deps.sql);
+    define('GET', '/v1/chronicle/seasons', async (ctx, deps) => {
+      const seasons = await listChronicles(ctx.sql);
       return {
         status: 200,
         body: {
@@ -1018,7 +1090,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/chronicle/seasons/:id', async (ctx, deps) => {
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('season id must be a uuid');
-      const chronicle = await getChronicle(deps.sql, id);
+      const chronicle = await getChronicle(ctx.sql, id);
       if (!chronicle) {
         return errorReply(404, 'not_found', 'no sealed season with that id', ctx.requestId);
       }
@@ -1035,7 +1107,7 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/chronicle/seasons/:id/battles', async (ctx, deps) => {
       const id = ctx.params['id'] ?? '';
       if (!UUID.test(id)) throw new BadRequestError('season id must be a uuid');
-      const battles = await listSealedBattles(deps.sql, id);
+      const battles = await listSealedBattles(ctx.sql, id);
       if (!battles) {
         return errorReply(404, 'not_found', 'no sealed season with that id', ctx.requestId);
       }
@@ -1071,7 +1143,7 @@ function buildRoutes(): Route[] {
       if (!UUID.test(eventId)) throw new BadRequestError('the event id must be a uuid');
       if (!SUBSCRIBED_TOPICS.has(topic)) return { status: 202, body: { status: 'ignored' } };
 
-      const outcome = await withInbox(deps.sql, topic, eventId, async (tx) => {
+      const outcome = await withInbox(ctx.sql, topic, eventId, async (tx) => {
         const userId = envelope.payload?.['userId'];
         if (typeof userId !== 'string' || !UUID.test(userId)) {
           throw new BadRequestError(`${USER_DELETED_TOPIC} requires a uuid userId`);
@@ -1133,7 +1205,7 @@ async function queueRoute(
 
   const done = deps.lifecycle.track();
   try {
-    const result = await queueWork(deps.sql, deps.producer, {
+    const result = await queueWork(ctx.sql, deps.producer, {
       cityId,
       userId,
       kind,
